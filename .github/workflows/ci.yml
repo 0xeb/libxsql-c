@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Linux
+            runner: ubuntu-latest
+          - os: macOS
+            runner: macos-latest
+          - os: Windows
+            runner: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Configure the full public surface: the static library with the vendored
+      # SQLite amalgamation plus the thin-client HTTP server/client (vendored
+      # civetweb). This compiles every shipped translation unit.
+      - name: Configure
+        shell: bash
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DXSQLC_WITH_THINCLIENT=ON
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release

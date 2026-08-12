@@ -1,0 +1,39 @@
+# Auto detect text files and normalize line endings to LF
+* text=auto eol=lf
+# Explicit text files
+*.c text eol=lf
+*.h text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.cmake text eol=lf
+*.json text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+CMakeLists.txt text eol=lf
+# Vendored SQLite amalgamation is large; treat as text but do not diff.
+external/sqlite/sqlite3.c -diff
+external/sqlite/sqlite3.h -diff
+external/sqlite/shell.c -diff
+external/civetweb/civetweb.c -diff
+external/civetweb/civetweb.h -diff
+# Binary files
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.a binary
+*.lib binary
+*.o binary
+*.obj binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+# Excluded from `git archive` (and thus from any public release):
+# AGENTS.md is private agent guidance, kept in source only; export-ignored.
+AGENTS.md export-ignore
+# The vendored SQLite CLI shell is not built by libxsql-c (library only); drop the
+# 1 MB source from release archives.
+external/sqlite/shell.c export-ignore
