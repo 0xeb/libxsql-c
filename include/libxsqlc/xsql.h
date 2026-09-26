@@ -26,6 +26,8 @@
 #include <libxsqlc/script.h>
 #include <libxsqlc/format.h>
 #include <libxsqlc/graph.h>
+#include <libxsqlc/json.h>
+#include <libxsqlc/regex.h>
 #include <libxsqlc/vtab.h>
 #include <libxsqlc/table_index.h>
 #include <libxsqlc/table_cached.h>

@@ -13,6 +13,7 @@
 
 #include "internal/internal.h"
 
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -294,6 +295,53 @@ static xsqlc_jval *jparse_number(jcursor *c) {
         return NULL;
     }
     v->num = strtod(tmp, NULL);
+
+    // Exact integer carriage, in addition to (never instead of) `num`. A double
+    // cannot hold a JSON integer past 2^53, and 64-bit addresses are exactly
+    // the case consumers care about. Only a literal that is integral in FORM
+    // qualifies: `1e3` and `2.0` stay double-only, because treating them as
+    // integers would be a parse decision this layer has no business making.
+    bool integral_form = true;
+    for (size_t i = 0; i < n; ++i) {
+        char ch = tmp[i];
+        if (ch == '.' || ch == 'e' || ch == 'E') {
+            integral_form = false;
+            break;
+        }
+    }
+    if (integral_form) {
+        errno = 0;
+        char *endp = NULL;
+        long long parsed = strtoll(tmp, &endp, 10);
+        // Require a full consume; a stray '+' the scanner allowed leaves
+        // is_int false and the caller falls back to `num`.
+        if (errno == 0 && endp && *endp == '\0' && endp != tmp) {
+            v->is_int = true;
+            v->i64    = (int64_t)parsed;
+        } else if (errno == ERANGE && endp && *endp == '\0' && endp != tmp &&
+                   tmp[0] != '-') {
+            // A ut64 ABOVE INT64_MAX. Leaving is_int false here is what the
+            // caller then punishes: it falls back to (int64_t)num, and an
+            // out-of-range double->int64 conversion is UNDEFINED BEHAVIOUR in
+            // C -- MSVC yields INT64_MIN. radare2 emits such literals for
+            // real: a register with no offset comes back as
+            // 18446744073709551615, and a write-cache sentinel as
+            // 0xfffffffffffffffe.
+            //
+            // nlohmann (the C++ tool's parser) keeps these as
+            // number_unsigned_t and get<int64_t>() reinterprets the bits, so
+            // the oracle reports -1 and -2. Retry as unsigned and store that
+            // same two's-complement reinterpretation, which makes the two
+            // parsers agree and removes the UB.
+            errno = 0;
+            char              *uendp = NULL;
+            unsigned long long u     = strtoull(tmp, &uendp, 10);
+            if (errno == 0 && uendp && *uendp == '\0') {
+                v->is_int = true;
+                v->i64    = (int64_t)(uint64_t)u;
+            }
+        }
+    }
     xsqlc_free(heap);
     return v;
 }

@@ -57,6 +57,10 @@ typedef struct {
     double                 est_rows;
     xsql_filter_op         op;  // always EQ for the generator's single-column path
     xsql_filter_factory_fn factory;
+    // Set INSTEAD of `factory` by xsql_generator_filter_eq_projection. Exactly
+    // one of the two is non-NULL; when this one is, xBestIndex carries colUsed
+    // to xFilter through idxStr (unused by this plan otherwise).
+    xsql_filter_projection_factory_fn factory_projection;
     void                  *user;
 } gen_filter;
 
@@ -68,6 +72,8 @@ typedef struct {
     double                        cost;
     double                        est_rows;
     xsql_generator_parametric_fn  factory;
+    // Set INSTEAD of `factory` by xsql_generator_parametric_filter_projection.
+    xsql_generator_parametric_projection_fn factory_projection;
     void                         *user;
 } gen_parametric_filter;
 

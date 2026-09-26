@@ -1304,10 +1304,13 @@ static int cached_delete(CachedVtab *vtab, sqlite3_value **argv) {
     xsqlc_transaction_touch(&vtab->transaction);
     fire_modify(def->before_modify_fn, def->before_user, "DELETE FROM ",
                 def->name);
+    // Surface the callback's reason (xsql_vtab_set_error) instead of SQLite's
+    // generic "SQL logic error", as the INSERT/UPDATE paths already do.
+    xsqlc_vtab_clear_error();
     bool ok = def->delete_fn(row_ptr, def->delete_user);
     xsqlc_free(temp);
     if (!ok) {
-        return SQLITE_ERROR;
+        return xsqlc_vtab_return_error(&vtab->base);
     }
     if (def->use_shared_cache) {
         xsqlc_cache_invalidate_after_mutation(def);

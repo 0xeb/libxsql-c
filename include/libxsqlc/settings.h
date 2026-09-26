@@ -99,6 +99,12 @@ XSQL_API bool xsql_settings_timeout_push(xsql_settings *s, int ms, int *effectiv
 XSQL_API bool xsql_settings_timeout_pop(xsql_settings *s, int *effective);
 XSQL_API size_t xsql_settings_get_max_timeout_stack_depth(xsql_settings *s);
 XSQL_API bool xsql_settings_timeout_stack_active(xsql_settings *s);
+
+// True when `UPDATE runtime_settings` accepts this key: registered writable AND
+// not an imperative action verb. `scope` cannot answer this on its own --
+// query_timeout_ms (tunable) and max_timeout_stack_depth (a read-only live
+// counter) are both scope="common". Unknown keys report false.
+XSQL_API bool xsql_settings_is_settable(xsql_settings *s, const char *key);
 XSQL_API bool xsql_settings_staged_query_timeout_active(xsql_settings *s);
 
 // ---------------------------------------------------------------------------

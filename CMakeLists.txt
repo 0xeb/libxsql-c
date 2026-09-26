@@ -11,7 +11,7 @@ cmake_minimum_required(VERSION 3.20)
 # Enable CMAKE_MSVC_RUNTIME_LIBRARY support (required for e.g. IDA SDK /MT hosts).
 cmake_policy(SET CMP0091 NEW)
 
-project(libxsqlc VERSION 0.0.1 LANGUAGES C)
+project(libxsqlc VERSION 0.0.2 LANGUAGES C)
 
 # Detect standalone vs. embedded (vendored subdirectory / larger project).
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -64,6 +64,8 @@ add_library(xsqlc ${XSQLC_LIB_TYPE}
     src/printer.c
     src/export.c
     src/json_emit.c
+    src/json_public.c
+    src/regex.c
     src/vtab_core.c
     src/transaction.c
     src/table_index.c

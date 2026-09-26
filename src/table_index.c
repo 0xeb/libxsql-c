@@ -501,7 +501,13 @@ static int index_update_impl(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv
         size_t rowid = (size_t)raw_rowid;
         xsqlc_transaction_touch(&vtab->transaction);
         fire_on_modify(def, "DELETE FROM ");
-        return def->delete_fn(rowid, def->delete_user) ? SQLITE_OK : SQLITE_ERROR;
+        // Surface the callback's reason (xsql_vtab_set_error) instead of SQLite's
+        // generic "SQL logic error", as the INSERT/UPDATE paths already do.
+        xsqlc_vtab_clear_error();
+        if (!def->delete_fn(rowid, def->delete_user)) {
+            return xsqlc_vtab_return_error(pVtab);
+        }
+        return SQLITE_OK;
     }
 
     // UPDATE: argc > 1, argv[0] = old rowid (non-NULL).

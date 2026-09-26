@@ -19,6 +19,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "internal/strbuf.h"
 
@@ -52,7 +53,16 @@ typedef struct xsqlc_jval xsqlc_jval;
 struct xsqlc_jval {
     xsqlc_jtype type;
     bool        bval;      // XSQLC_JBOOL
-    double      num;       // XSQLC_JNUM
+    double      num;       // XSQLC_JNUM (always set)
+    // Exact integer carriage. `num` alone cannot represent a JSON integer
+    // beyond 2^53, and consumers do hit that: radare2 emits full 64-bit
+    // addresses, so `0x7ff6e2c14a01` style values round through a double and
+    // come back wrong. When the literal is integral in FORM (no '.', no
+    // exponent) and fits int64_t exactly, `is_int` is true and `i64` holds the
+    // exact value. `num` keeps its old meaning either way, so every existing
+    // reader is unaffected.
+    bool        is_int;    // XSQLC_JNUM: i64 is exact
+    int64_t     i64;       // XSQLC_JNUM and is_int
     char       *str;       // XSQLC_JSTR (decoded; xsqlc heap)
     size_t      strlen;    // byte length of str (embedded-NUL safe)
 

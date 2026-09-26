@@ -372,6 +372,23 @@ static void emit_scope(
     xsql_result_text_static(context, runtime->entry.scope);
 }
 
+static void emit_kind(
+    xsql_context *context, const void *row, void *user) {
+    (void)user;
+    const runtime_row *runtime = (const runtime_row *)row;
+    xsql_result_text_static(
+        context,
+        strcmp(runtime->entry.scope, "action") == 0 ? "action" : "value");
+}
+
+// xsql_cached_col_int takes a value-returning getter, not an emitter.
+static int emit_settable(const void *row, void *user) {
+    const runtime_row *runtime = (const runtime_row *)row;
+    xsql_runtime_settings_table *table =
+        (xsql_runtime_settings_table *)user;
+    return xsql_settings_is_settable(table->settings, runtime->entry.key) ? 1 : 0;
+}
+
 static bool stage_value(
     void *row, xsql_value *value, void *user) {
     runtime_row *runtime = (runtime_row *)row;
@@ -518,7 +535,11 @@ xsql_runtime_settings_table *xsql_runtime_settings_table_new(
         xsql_cached_col_text(
             table->definition, "type", emit_type, table) != XSQL_OK ||
         xsql_cached_col_text(
-            table->definition, "scope", emit_scope, table) != XSQL_OK) {
+            table->definition, "scope", emit_scope, table) != XSQL_OK ||
+        xsql_cached_col_text(
+            table->definition, "kind", emit_kind, table) != XSQL_OK ||
+        xsql_cached_col_int(
+            table->definition, "settable", emit_settable, table) != XSQL_OK) {
         xsql_runtime_settings_table_free(table);
         return NULL;
     }

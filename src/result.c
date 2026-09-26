@@ -396,6 +396,26 @@ int xsql_db_query_opts(xsql_db *db, const char *sql, const xsql_query_opts *opts
         return rc;
     }
 
+    // A NULL handle with SQLITE_OK: the text held no statement at all. SQLite
+    // answers that way for whitespace and for a TRAILING COMMENT, and a `.sql`
+    // file ending in a comment is ordinary input, not an error.
+    //
+    // Stepping NULL here returns SQLITE_MISUSE, and sqlite3_errmsg() on a db
+    // that never failed then reports "not an error" -- so the script exits 1
+    // with a nonsense message while its stdout is correct. The C++ side cannot
+    // reach this: Statement::valid() is false for a NULL handle, so the
+    // statement is simply skipped (statement.cpp:45). Match that.
+    if (!stmt) {
+        r->elapsed_ms = elapsed_ms_since(started_ms);
+        if (guard_enabled) {
+            xsqlc_interrupt_guard_leave(&interrupt_guard);
+            xsqlc_progress_guard_leave(&progress_guard);
+        }
+        xsqlc_str_set(&db->last_error, NULL);
+        *out = r;
+        return SQLITE_OK;
+    }
+
     // Collect column names up front (before the step loop).
     int col_count = sqlite3_column_count(stmt);
     const bool partial_capable =

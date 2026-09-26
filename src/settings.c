@@ -369,6 +369,20 @@ size_t xsql_settings_get_max_timeout_stack_depth(
     return value;
 }
 
+bool xsql_settings_is_settable(xsql_settings *settings, const char *key) {
+    if (!settings || !key) {
+        return false;
+    }
+    sqlite3_mutex_enter(settings->mtx);
+    const xsqlc_setting_record *record = find_record_locked(settings, key);
+    // An action row is never settable even if registered writable: timeout_push
+    // and timeout_pop are imperative verbs, not values.
+    bool settable = record && record->writable &&
+                    strcmp(record->scope, "action") != 0;
+    sqlite3_mutex_leave(settings->mtx);
+    return settable;
+}
+
 bool xsql_settings_timeout_stack_active(xsql_settings *settings) {
     if (!settings) {
         return false;

@@ -527,6 +527,31 @@ static void probe_constraint_filter(const gen_constraint_filter *cf,
     *required_ok = req_ok;
 }
 
+// colUsed carriage, shared by the three projection-aware plans (full scan,
+// filter_eq, parametric). SQLite gives xFilter no colUsed of its own, so
+// xBestIndex stashes it as a decimal string in idxStr and xFilter decodes it.
+// Safe on all three because none of those plans uses idxStr for anything else —
+// only the constraint-filter plan does, and it has no projection variant.
+static bool gen_set_col_used_idxstr(sqlite3_index_info *info) {
+    char *s = sqlite3_mprintf("%llu", (unsigned long long)info->colUsed);
+    if (!s) {
+        return false;
+    }
+    info->idxStr = s;
+    info->needToFreeIdxStr = 1;
+    return true;
+}
+
+// Decode what the above wrote. An absent or unparseable string means "every
+// column" — the conservative answer, since a producer that assumes a column is
+// unused when it is would return wrong data rather than slow data.
+static uint64_t gen_col_used_from_idxstr(const char *idxStr) {
+    if (!idxStr || !*idxStr) {
+        return ~(uint64_t)0;
+    }
+    return (uint64_t)strtoull(idxStr, NULL, 10);
+}
+
 static int generator_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
     GeneratorVtab *vtab = (GeneratorVtab *)pVtab;
     const xsql_generator_table *def = vtab->def;
@@ -637,6 +662,12 @@ static int generator_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
         info->idxNum = pf->filter_id;
         info->estimatedCost = pf->cost;
         info->estimatedRows = (sqlite3_int64)pf->est_rows;
+        // Projection-aware parametric: carry colUsed through idxStr. This plan
+        // sets no idxStr otherwise, so there is nothing to collide with (the
+        // constraint-filter plan above owns idxStr, and returned already).
+        if (pf->factory_projection && !gen_set_col_used_idxstr(info)) {
+            return SQLITE_NOMEM;
+        }
         return SQLITE_OK;
     }
 
@@ -660,6 +691,10 @@ static int generator_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
         info->idxNum = best_filter->filter_id;
         info->estimatedCost = best_filter->cost;
         info->estimatedRows = (sqlite3_int64)best_filter->est_rows;
+        // Projection-aware single-column filter: same idxStr carriage as above.
+        if (best_filter->factory_projection && !gen_set_col_used_idxstr(info)) {
+            return SQLITE_NOMEM;
+        }
         return SQLITE_OK;
     }
 
@@ -683,12 +718,8 @@ static int generator_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
     // generator can skip expensive unused columns. Only the GEN_FILTER_NONE plan reaches
     // xFilter's full-scan branch and uses idxStr (filter/constraint plans returned
     // above), so there is no collision. Only allocated for projection-aware tables.
-    if (def->projection_generator_fn) {
-        char *s = sqlite3_mprintf("%llu", (unsigned long long)info->colUsed);
-        if (s) {
-            info->idxStr = s;
-            info->needToFreeIdxStr = 1;
-        }
+    if (def->projection_generator_fn && !gen_set_col_used_idxstr(info)) {
+        return SQLITE_NOMEM;
     }
     return SQLITE_OK;
 }
@@ -817,7 +848,12 @@ static int generator_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
             xsqlc_vtab_clear_error();
             xsql_generator gen;
             memset(&gen, 0, sizeof(gen));
-            bool built = pf->factory(argc, (xsql_value **)argv, &gen, pf->user);
+            bool built =
+                pf->factory_projection
+                    ? pf->factory_projection(argc, (xsql_value **)argv,
+                                             gen_col_used_from_idxstr(idxStr),
+                                             &gen, pf->user)
+                    : pf->factory(argc, (xsql_value **)argv, &gen, pf->user);
             prime_generator(cur, &gen, built);
             if (xsqlc_vtab_has_error()) {
                 return xsqlc_vtab_return_error(pCursor->pVtab);
@@ -835,7 +871,13 @@ static int generator_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
             cur->iterator_eof = true;
             xsql_row_iter it;
             memset(&it, 0, sizeof(it));
-            if (fl->factory((xsql_value *)argv[0], &it, fl->user)) {
+            bool made =
+                fl->factory_projection
+                    ? fl->factory_projection((xsql_value *)argv[0],
+                                             gen_col_used_from_idxstr(idxStr),
+                                             &it, fl->user)
+                    : fl->factory((xsql_value *)argv[0], &it, fl->user);
+            if (made) {
                 cur->iter = it;
                 cur->has_iter = true;
                 cur->iterator_eof = !cur->iter.next(cur->iter.self);
@@ -854,10 +896,7 @@ static int generator_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
     }
     if (def->projection_generator_fn) {
         // Projection-aware full scan: decode colUsed (set on the GEN_FILTER_NONE plan).
-        uint64_t col_used = ~(uint64_t)0;  // absent/unparseable => all columns (safe)
-        if (idxStr && *idxStr) {
-            col_used = (uint64_t)strtoull(idxStr, NULL, 10);
-        }
+        uint64_t col_used = gen_col_used_from_idxstr(idxStr);
         xsqlc_vtab_clear_error();
         xsql_generator gen;
         memset(&gen, 0, sizeof(gen));
@@ -1395,8 +1434,11 @@ int xsql_generator_hidden_col_text(xsql_generator_table *g, const char *name) {
     return add_hidden_column(g, name, XSQL_COL_TEXT);
 }
 
+// Exactly one of `factory` / `factory_projection` is non-NULL; the struct is
+// memset first so the other stays NULL, which is what xFilter branches on.
 static int add_filter(xsql_generator_table *g, const char *column, double cost,
                       double est_rows, xsql_filter_factory_fn factory,
+                      xsql_filter_projection_factory_fn factory_projection,
                       void *user) {
     if (!g) {
         return XSQL_MISUSE;
@@ -1410,12 +1452,14 @@ static int add_filter(xsql_generator_table *g, const char *column, double cost,
         return XSQL_NO_MEMORY;
     }
     gen_filter *f = &g->filters[g->nfilters];
+    memset(f, 0, sizeof(*f));
     f->column_index = col;
     f->filter_id = (int)g->nfilters + 1;
     f->cost = cost;
     f->est_rows = est_rows;
     f->op = XSQL_FILTER_EQ;
     f->factory = factory;
+    f->factory_projection = factory_projection;
     f->user = user;
     g->nfilters++;
     return XSQL_OK;
@@ -1424,19 +1468,25 @@ static int add_filter(xsql_generator_table *g, const char *column, double cost,
 int xsql_generator_filter_eq(xsql_generator_table *g, const char *column,
                              double cost, double est_rows,
                              xsql_filter_factory_fn factory, void *user) {
-    return add_filter(g, column, cost, est_rows, factory, user);
+    return add_filter(g, column, cost, est_rows, factory, NULL, user);
 }
 int xsql_generator_filter_eq_text(xsql_generator_table *g, const char *column,
                                   double cost, double est_rows,
                                   xsql_filter_factory_fn factory, void *user) {
-    return add_filter(g, column, cost, est_rows, factory, user);
+    return add_filter(g, column, cost, est_rows, factory, NULL, user);
+}
+int xsql_generator_filter_eq_projection(
+    xsql_generator_table *g, const char *column, double cost, double est_rows,
+    xsql_filter_projection_factory_fn factory, void *user) {
+    return add_filter(g, column, cost, est_rows, NULL, factory, user);
 }
 
-int xsql_generator_parametric_filter(xsql_generator_table *g,
-                                     const char *const *columns, size_t ncolumns,
-                                     double cost, double est_rows,
-                                     xsql_generator_parametric_fn factory,
-                                     void *user) {
+// As with add_filter: exactly one factory is set, the struct is zeroed first.
+static int add_parametric(xsql_generator_table *g, const char *const *columns,
+                          size_t ncolumns, double cost, double est_rows,
+                          xsql_generator_parametric_fn factory,
+                          xsql_generator_parametric_projection_fn factory_projection,
+                          void *user) {
     if (!g) {
         return XSQL_MISUSE;
     }
@@ -1468,9 +1518,27 @@ int xsql_generator_parametric_filter(xsql_generator_table *g,
     pf->cost = cost;
     pf->est_rows = est_rows;
     pf->factory = factory;
+    pf->factory_projection = factory_projection;
     pf->user = user;
     g->nparam++;
     return XSQL_OK;
+}
+
+int xsql_generator_parametric_filter(xsql_generator_table *g,
+                                     const char *const *columns, size_t ncolumns,
+                                     double cost, double est_rows,
+                                     xsql_generator_parametric_fn factory,
+                                     void *user) {
+    return add_parametric(g, columns, ncolumns, cost, est_rows, factory, NULL,
+                          user);
+}
+
+int xsql_generator_parametric_filter_projection(
+    xsql_generator_table *g, const char *const *columns, size_t ncolumns,
+    double cost, double est_rows,
+    xsql_generator_parametric_projection_fn factory, void *user) {
+    return add_parametric(g, columns, ncolumns, cost, est_rows, NULL, factory,
+                          user);
 }
 
 int xsql_generator_constraint_filter(xsql_generator_table *g,

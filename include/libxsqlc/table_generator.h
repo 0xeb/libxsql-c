@@ -126,6 +126,18 @@ typedef bool (*xsql_generator_make_projection_fn)(uint64_t col_used,
 // configured column, in registration order).
 typedef bool (*xsql_generator_parametric_fn)(int argc, xsql_value **argv,
                                              xsql_generator *out, void *user);
+// Projection-aware variants of the two EQ-driven factories. They receive the
+// same colUsed bitmask as xsql_generator_make_projection_fn, so a filtered query
+// that does not select an expensive or non-portable column can be routed to a
+// cheaper producer than one that does — the pushdown and the projection lever
+// compose instead of being mutually exclusive.
+typedef bool (*xsql_filter_projection_factory_fn)(xsql_value *arg,
+                                                  uint64_t col_used,
+                                                  xsql_row_iter *out, void *user);
+typedef bool (*xsql_generator_parametric_projection_fn)(int argc, xsql_value **argv,
+                                                        uint64_t col_used,
+                                                        xsql_generator *out,
+                                                        void *user);
 // Constraint factory: each matched constraint arrives with its column + operator.
 typedef bool (*xsql_generator_constraint_fn)(int argc,
                                              const xsql_constraint_arg *args,
@@ -256,6 +268,13 @@ XSQL_API int xsql_generator_filter_eq_text(xsql_generator_table *g,
                                            xsql_filter_factory_fn factory,
                                            void *user);
 
+// Projection-aware single-column equality pushdown: exactly filter_eq(), except
+// the factory also receives colUsed. Strictly additive — a table that never
+// registers one of these plans and behaves byte-for-byte as before.
+XSQL_API int xsql_generator_filter_eq_projection(
+    xsql_generator_table *g, const char *column, double cost, double est_rows,
+    xsql_filter_projection_factory_fn factory, void *user);
+
 // Parametric filter: fires only when EVERY listed column has a usable equality
 // constraint; the values reach the factory in `columns` order.
 XSQL_API int xsql_generator_parametric_filter(xsql_generator_table *g,
@@ -264,6 +283,13 @@ XSQL_API int xsql_generator_parametric_filter(xsql_generator_table *g,
                                               double est_rows,
                                               xsql_generator_parametric_fn factory,
                                               void *user);
+
+// Projection-aware parametric filter (see filter_eq_projection for the
+// rationale). Also strictly additive.
+XSQL_API int xsql_generator_parametric_filter_projection(
+    xsql_generator_table *g, const char *const *columns, size_t ncolumns,
+    double cost, double est_rows,
+    xsql_generator_parametric_projection_fn factory, void *user);
 
 // General multi-operator constraint filter. A required spec that is absent fails
 // the query with its missing_error (or, when that is empty, falls through to a

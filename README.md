@@ -178,7 +178,9 @@ never materializes, so `LIMIT` stops work early — you supply an
 `xsql_generator` (`next`/`current`/`rowid`/`destroy`) via a factory, plus
 hidden columns, parametric/constraint filters, and ORDER BY elision.
 `xsql_generator_count` adds an opt-in exact `COUNT(*)` path that does not create
-or walk a generator.
+or walk a generator. `xsql_generator_filter_eq_projection` and
+`xsql_generator_parametric_filter_projection` pass the statement's used-column
+mask to the filter, so a source can skip computing columns the query never reads.
 
 All three table flavors support a full transaction lifecycle through
 `xsql_transaction_hooks`: connection-local state, prepare/commit/rollback, and
@@ -214,6 +216,16 @@ provisional output. Returning `false` from the sink stops immediately; timeouts
 and cancellation retain the same partial-result metadata as the buffered
 runner.
 
+### JSON DOM and REGEXP
+
+`<libxsqlc/json.h>` parses JSON into a read-only DOM (`xsql_json_parse`, typed
+accessors, array/object walkers, `xsql_json_member`); integers keep their exact
+64-bit value (`xsql_json_is_int`, `xsql_json_i64`) instead of rounding through a
+double. `<libxsqlc/regex.h>` is a small backtracking engine for a documented subset
+of ECMAScript regular expressions (`xsql_regex_compile`, `xsql_regex_search`,
+`xsql_regex_match`) -- C11 has no regex and MSVC lacks POSIX `<regex.h>` -- so hosts
+can back SQLite's `REGEXP` operator the way the C++ sibling does with `std::regex`.
+
 ### Query timeouts and cooperative cancellation
 
 A nonzero `xsql_query_opts::timeout_ms` installs a real, monotonic deadline
@@ -241,7 +253,9 @@ the same deadline; embedders can install their own predicate with
 `<libxsqlc/settings.h>` provides a thread-safe typed settings registry (common
 and product-specific boolean, integer, and string values), a bounded scoped
 timeout stack, and the canonical transactional
-`runtime_settings(key,value,type,scope)` virtual table. Value-carrying PRAGMAs
+`runtime_settings(key,value,type,scope,kind,settable)` virtual table (`kind` is
+`value` or `action`; `settable` is 1 only for rows `UPDATE` accepts, so
+`WHERE settable = 1` lists the tunable keys). Value-carrying PRAGMAs
 are retired; only the action verbs `timeout_push` and `timeout_pop` remain.
 The original fixed-size reply/enumeration APIs remain ABI-stable; use the
 corresponding `_v2` entry points for string values up to 127 bytes and product
