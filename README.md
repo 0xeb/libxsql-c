@@ -1,5 +1,11 @@
 # libxsql-c
 
+<p align="center">
+  <a href="https://paypal.me/EliasBachaalany"><img alt="Donate with PayPal" src="https://img.shields.io/badge/Donate-PayPal-0070e0?style=for-the-badge&logo=paypal&logoColor=white"></a>
+  <a href="https://buymeacoffee.com/0xeb"><img alt="Buy Me a Coffee" src="https://img.shields.io/badge/Buy_Me_a_Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black"></a>
+  <a href="https://github.com/0xeb/libxsql-c"><img alt="Star libxsql-c on GitHub" src="https://img.shields.io/github/stars/0xeb/libxsql-c?style=for-the-badge&logo=github&label=Star&color=24292f"></a>
+</p>
+
 Pure-C (C11) **libxsql** — an ergonomic framework for exposing
 host-application data as SQLite virtual tables, plus scalar/aggregate
 functions, bounded-memory script streaming/export, query timeouts,
@@ -321,6 +327,18 @@ vendored civetweb (MIT); no transport type appears in any public header.
 - Server-info banners `xsql_format_http_info` / `xsql_format_http_status`, and a
   static `status_fields` map on the server config (merged into `/status` under
   `status_fn`).
+
+## Support
+
+If libxsql-c saves you time, a donation funds the next release, and a star helps others find it.
+
+<p>
+  <a href="https://paypal.me/EliasBachaalany"><img alt="Donate with PayPal" src="https://img.shields.io/badge/Donate-PayPal-0070e0?style=for-the-badge&logo=paypal&logoColor=white"></a>
+  <a href="https://buymeacoffee.com/0xeb"><img alt="Buy Me a Coffee" src="https://img.shields.io/badge/Buy_Me_a_Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black"></a>
+  <a href="https://github.com/0xeb/libxsql-c"><img alt="Star libxsql-c on GitHub" src="https://img.shields.io/github/stars/0xeb/libxsql-c?style=for-the-badge&logo=github&label=Star&color=24292f"></a>
+</p>
+
+Bug reports with a minimal reproduction are just as valuable.
 
 ## License and Terms of Use
 
