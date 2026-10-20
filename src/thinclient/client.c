@@ -8,6 +8,7 @@
 // client API. Response bodies are heap strings owned by the library.
 
 #include "libxsqlc/http_client.h"
+#include "libxsqlc/clipboard.h"
 
 #include "internal/internal.h"
 #include "internal/strbuf.h"
@@ -18,6 +19,7 @@
 
 struct xsql_http_client {
     char *host;         // heap
+    char *url_host;     // heap: host for the Host header, IPv6 bracketed
     int   port;
     int   timeout_sec;
     char *auth_token;   // heap or NULL
@@ -62,16 +64,16 @@ int xsql_http_client_new(const xsql_http_client_config *cfg,
         }
     }
     c->host = xsqlc_strdup(host);
-    if (!c->host) {
-        xsqlc_free(c);
+    c->url_host = xsql_format_url_host(host);
+    if (!c->host || !c->url_host) {
+        xsql_http_client_free(c);
         return XSQL_NO_MEMORY;
     }
     if (CLIENT_CONFIG_HAS(cfg, auth_token) &&
         cfg->auth_token && cfg->auth_token[0]) {
         c->auth_token = xsqlc_strdup(cfg->auth_token);
         if (!c->auth_token) {
-            xsqlc_free(c->host);
-            xsqlc_free(c);
+            xsql_http_client_free(c);
             return XSQL_NO_MEMORY;
         }
     }
@@ -86,6 +88,7 @@ void xsql_http_client_free(xsql_http_client *c) {
         return;
     }
     xsqlc_free(c->host);
+    xsqlc_free(c->url_host);
     xsqlc_free(c->auth_token);
     xsqlc_free(c);
 }
@@ -120,7 +123,7 @@ static int do_request(xsql_http_client *c, const char *method, const char *path,
               "Connection: close\r\n"
               "Content-Type: text/plain\r\n"
               "Content-Length: %zu\r\n",
-              method, path, c->host, c->port, blen);
+              method, path, c->url_host, c->port, blen);
     if (c->auth_token) {
         mg_printf(conn, "X-XSQL-Token: %s\r\n", c->auth_token);
     }
@@ -141,6 +144,7 @@ static int do_request(xsql_http_client *c, const char *method, const char *path,
 
     const struct mg_response_info *ri = mg_get_response_info(conn);
     int status = ri ? ri->status_code : 0;
+    const long long content_length = ri ? ri->content_length : -1;
     if (http_status) {
         *http_status = status;
     }
@@ -157,6 +161,14 @@ static int do_request(xsql_http_client *c, const char *method, const char *path,
     if (xsqlc_sb_oom(&sb)) {
         xsqlc_sb_free(&sb);
         return XSQL_NO_MEMORY;
+    }
+    if (n < 0 || (content_length >= 0 && (unsigned long long)content_length != (unsigned long long)sb.len)) {
+        xsqlc_sb_free(&sb);
+        if (body_out) {
+            *body_out = xsqlc_strdup("incomplete HTTP response body");
+            if (!*body_out) return XSQL_NO_MEMORY;
+        }
+        return XSQL_IO_ERROR;
     }
     if (body_out) {
         *body_out = xsqlc_sb_detach(&sb);

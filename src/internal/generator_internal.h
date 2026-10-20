@@ -49,18 +49,23 @@ typedef struct {
     void *user;
 } gen_column;
 
-// Single-column equality pushdown (filter_eq / filter_eq_text). filter_id 1..n.
+// Single-column pushdown (filter_eq / filter_eq_text / filter_eq_projection on
+// EQ, filter_like_text on LIKE). filter_id 1..n.
 typedef struct {
     int                    column_index;
     int                    filter_id;
     double                 cost;
     double                 est_rows;
-    xsql_filter_op         op;  // always EQ for the generator's single-column path
+    xsql_filter_op         op;  // EQ (trusted, omit=1) or LIKE (superset, omit=0)
+    int                    key_kind;  // xsqlc_key_kind: how an EQ factory reads arg
+    // Exactly one factory is non-NULL. `factory` is the plain EQ factory.
     xsql_filter_factory_fn factory;
-    // Set INSTEAD of `factory` by xsql_generator_filter_eq_projection. Exactly
-    // one of the two is non-NULL; when this one is, xBestIndex carries colUsed
-    // to xFilter through idxStr (unused by this plan otherwise).
+    // xsql_generator_filter_eq_projection: xBestIndex carries colUsed to xFilter
+    // through idxStr (unused by this plan otherwise).
     xsql_filter_projection_factory_fn factory_projection;
+    // xsql_generator_filter_like_text (op LIKE): gets the pattern text and
+    // colUsed, carried the same way.
+    xsql_filter_like_factory_fn factory_like;
     void                  *user;
 } gen_filter;
 
@@ -96,7 +101,11 @@ typedef struct {
     bool                         has_order;
     int                          ordered_column;
     bool                         ordered_desc;
+    // Exactly one factory is non-NULL. With factory_projection (from
+    // xsql_generator_constraint_filter_projection) xBestIndex prefixes idxStr
+    // with "<colUsed>;"; a plain filter's idxStr stays the bare spec list.
     xsql_generator_constraint_fn factory;
+    xsql_generator_constraint_projection_fn factory_projection;
     void                        *user;
 } gen_constraint_filter;
 
@@ -139,6 +148,8 @@ struct xsql_generator_table {
     bool                         supports_insert;
     xsql_generator_row_lookup_fn lookup_fn;
     void                        *lookup_user;
+    // false => writes stay out of xsql_db_vtab_write_count (default true).
+    bool                         counts_as_write;
 };
 
 #endif  // XSQLC_INTERNAL_GENERATOR_INTERNAL_H

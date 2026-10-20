@@ -7,7 +7,8 @@
 // http_server.c — the consolidated thin-client HTTP query server over the
 // vendored civetweb transport. Serves GET / (A4
 // uppercased landing), GET /help, POST /query (executor precedence + queue /
-// serialize modes + ?format), GET /status (A5 RFC 7386 merge), POST /cancel,
+// serialize modes + ?format=json|jsonl|text|csv|tsv + X-XSQL-Stream chunked
+// streaming + X-XSQL-Timeout), GET /status (A5 RFC 7386 merge), POST /cancel,
 // POST /shutdown.
 // A13 (port 0 -> random [8100,8999]) and A17 (callback error handling: a
 // callback that returns an error / leaves no body yields a JSON error envelope
@@ -25,8 +26,12 @@
 #endif
 
 #include "libxsqlc/http_server.h"
+#include "libxsqlc/clipboard.h"
 
 #include "thinclient/http_internal.h"
+#ifdef XSQLC_HAS_GZIP
+#  include "thinclient/gzip.h"
+#endif
 
 #include "internal/internal.h"
 #include "internal/strbuf.h"
@@ -35,7 +40,10 @@
 #include "libxsqlc/format.h"
 #include "libxsqlc/script.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(_WIN32)
@@ -330,7 +338,21 @@ struct xsql_http_server {
 
     xsql_http_interrupt_fn interrupt_fn;
     void                  *interrupt_user;
+
+    // POST /cancel downstream hook (ABI-growth; NULL when absent or legacy size).
+    xsql_http_cancel_fn cancel_fn;
+    void               *cancel_user;
+
+    // Chunked-response executor (ABI-growth; NULL when absent or legacy size).
+    xsql_http_stream_executor_fn stream_executor;
+    void                        *stream_user;
 };
+
+// True when a caller's config (sized by struct_size) covers `field`. A zero or
+// legacy struct_size leaves every later field at its default.
+#define XSQLC_CFG_HAS(cfg, field)                                   \
+    ((cfg)->struct_size >= offsetof(xsql_http_server_config, field) + \
+                               sizeof((cfg)->field))
 
 static unsigned long long cancel_epoch_snapshot(xsql_http_server *s) {
     xsqlc_mtx_lock(s->cancel_mtx);
@@ -699,13 +721,45 @@ static void gate_release(xsql_http_server *s) {
 // HTTP response helpers
 // ===========================================================================
 
+#ifdef XSQLC_HAS_GZIP
+// Whether this response gets gzip'd: the client asked for it and the media type
+// is compressible (xsqlc_http_can_compress).
+static bool wants_gzip(struct mg_connection *conn, const char *ctype) {
+    return xsqlc_http_accepts_gzip(mg_get_header(conn, "Accept-Encoding")) &&
+           xsqlc_http_can_compress(ctype);
+}
+#endif
+
 static void send_response(struct mg_connection *conn, int status,
                           const char *ctype, const char *body, size_t len) {
     const char *reason = mg_get_response_code_text(conn, status);
-    // Frame the body strictly by Content-Length (no "Connection: close", which
-    // makes some clients switch to read-until-EOF and wait out civetweb's
-    // graceful-close discard-read). civetweb is configured with keep-alive off,
-    // so the connection is closed after the response regardless.
+    ctype = ctype ? ctype : "text/plain";
+#ifdef XSQLC_HAS_GZIP
+    // Every route compresses the same way, as httplib does for the C++ server.
+    // An empty body stays uncompressed; an allocation failure falls back to the
+    // plain body rather than failing the response.
+    if (len && body && wants_gzip(conn, ctype)) {
+        size_t zlen = 0;
+        char *z = xsqlc_gzip_buffer(body, len, &zlen);
+        if (z) {
+            mg_printf(conn,
+                      "HTTP/1.1 %d %s\r\n"
+                      "Content-Type: %s\r\n"
+                      "Content-Encoding: gzip\r\n"
+                      "Vary: Accept-Encoding\r\n"
+                      "Content-Length: %zu\r\n"
+                      "\r\n",
+                      status, reason ? reason : "", ctype, zlen);
+            mg_write(conn, z, zlen);
+            xsqlc_free(z);
+            return;
+        }
+    }
+#endif
+    // Frame the body strictly by Content-Length: keep-alive is on, so the next
+    // response on this connection starts right after these bytes. (No
+    // "Connection: close" either: it makes some clients read until EOF and wait
+    // out civetweb's graceful-close discard-read.)
     mg_printf(conn,
               "HTTP/1.1 %d %s\r\n"
               "Content-Type: %s\r\n"
@@ -746,6 +800,9 @@ static void send_formatted(struct mg_connection *conn,
     } else if (strcmp(format, "tsv") == 0) {
         out = xsql_script_result_to_tsv(r);
         ctype = "text/tab-separated-values";
+    } else if (strcmp(format, "jsonl") == 0) {
+        out = xsql_script_result_to_jsonl(r);
+        ctype = "application/x-ndjson";
     } else {
         out = xsql_script_result_to_json(r, include_sql);
         ctype = "application/json";
@@ -812,18 +869,31 @@ static void handle_root(xsql_http_server *s, struct mg_connection *conn) {
         }
         xsqlc_sb_putc(&sb, (char)c);
     }
+    // /cancel exists as a route for every config but is a 409 unless the
+    // whole-script executor is wired; only advertise what actually works.
+    const bool cancel_supported = s->script_executor != NULL;
     xsqlc_sb_append(&sb,
                     " HTTP Server\n\nEndpoints:\n"
                     "  GET  /help     - API documentation\n"
-                    "  POST /query    - Execute SQL query\n"
+                    "  POST /query    - Execute SQL query\n");
+    if (cancel_supported) {
+        xsqlc_sb_append(&sb, "  POST /cancel   - Cancel the in-flight query\n");
+    }
+    xsqlc_sb_append(&sb,
                     "  GET  /status   - Health check\n"
-                    "  POST /cancel   - Cancel active queries\n"
                     "  POST /shutdown - Stop server\n\n"
                     "Example: curl -X POST http://localhost:");
     xsqlc_sb_append_i64(&sb, s->port);
     xsqlc_sb_append(&sb,
-                    "/query -d \"SELECT name FROM sqlite_master WHERE "
+                    "/query --data-binary \"SELECT name FROM sqlite_master WHERE "
                     "type='table' LIMIT 10\"\n");
+    if (cancel_supported) {
+        // -d '' deliberately emits Content-Length: 0; a bodyless POST left
+        // unframed makes the server wait for a body boundary.
+        xsqlc_sb_append(&sb, "Cancel:  curl -X POST -d '' http://localhost:");
+        xsqlc_sb_append_i64(&sb, s->port);
+        xsqlc_sb_append(&sb, "/cancel\n");
+    }
     if (xsqlc_sb_oom(&sb)) {
         xsqlc_sb_free(&sb);
         send_response(conn, 200, "text/plain", "", 0);
@@ -944,17 +1014,150 @@ static char *read_body(struct mg_connection *conn,
     return xsqlc_sb_detach(&sb);
 }
 
-static bool get_param(const struct mg_request_info *ri, const char *name,
-                      char *buf, size_t buflen) {
+// Query-parameter lookup results (mg_get_var2's contract, named).
+enum param_result { PARAM_FOUND, PARAM_ABSENT, PARAM_TOO_LONG };
+
+static enum param_result lookup_param(const struct mg_request_info *ri,
+                                      const char *name, char *buf,
+                                      size_t buflen) {
     if (buflen) {
         buf[0] = '\0';
     }
     if (!ri->query_string) {
-        return false;
+        return PARAM_ABSENT;
     }
     int r = mg_get_var2(ri->query_string, strlen(ri->query_string), name, buf,
                         buflen, 0);
-    return r >= 0;
+    if (r >= 0) {
+        return PARAM_FOUND;
+    }
+    if (buflen) {
+        buf[0] = '\0';
+    }
+    return r == -2 ? PARAM_TOO_LONG : PARAM_ABSENT;
+}
+
+static bool get_param(const struct mg_request_info *ri, const char *name,
+                      char *buf, size_t buflen) {
+    return lookup_param(ri, name, buf, buflen) == PARAM_FOUND;
+}
+
+static bool is_known_format(const char *format) {
+    return strcmp(format, "json") == 0 || strcmp(format, "jsonl") == 0 ||
+           strcmp(format, "text") == 0 || strcmp(format, "csv") == 0 ||
+           strcmp(format, "tsv") == 0;
+}
+
+// `X-XSQL-Timeout: <ms>` -> opts->timeout_ms for every executor (C++ parse_opts).
+// Absent, unparseable, or negative leaves the default (0, no limit); a value past
+// INT_MAX clamps to INT_MAX, which is what a client sending a huge value means.
+static void apply_timeout_header(struct mg_connection *conn,
+                                 xsql_script_opts *opts) {
+    const char *h = mg_get_header(conn, "X-XSQL-Timeout");
+    if (!h) {
+        return;
+    }
+    char *end = NULL;
+    errno = 0;
+    long long v = strtoll(h, &end, 10);
+    if (end == h) {
+        return;
+    }
+    if (errno == ERANGE) {
+        if (v > 0) {
+            opts->timeout_ms = INT_MAX;
+        }
+        return;
+    }
+    if (v >= 0) {
+        opts->timeout_ms = v > INT_MAX ? INT_MAX : (int)v;
+    }
+}
+
+// The client's X-XSQL-Stream opt-in: "1"/"true" selects the JSON envelope,
+// "ndjson" one object per line. Returns false when the request does not stream.
+static bool stream_requested(struct mg_connection *conn, bool *ndjson) {
+    const char *h = mg_get_header(conn, "X-XSQL-Stream");
+    *ndjson = h && strcmp(h, "ndjson") == 0;
+    return *ndjson || (h && (strcmp(h, "1") == 0 || strcmp(h, "true") == 0));
+}
+
+// One chunked-transfer frame per coalesced write. mg_send_chunk takes an
+// unsigned int length, so a (theoretical) larger span is framed in pieces; a
+// zero-length frame would be the terminator, so it is never sent here.
+static bool send_chunk_frames(const char *data, size_t len, void *user) {
+    struct mg_connection *conn = (struct mg_connection *)user;
+    while (len > 0) {
+        unsigned int n = len > 0x40000000u ? 0x40000000u : (unsigned int)len;
+        if (mg_send_chunk(conn, data, n) < 0) {
+            return false;
+        }
+        data += n;
+        len -= n;
+    }
+    return true;
+}
+
+// Serve a streamed /query: status line + chunked headers, then the executor's
+// output through a coalescer, then the terminating chunk. The caller still holds
+// the serialize gate, so it covers the whole stream (C++ moves its lock into the
+// chunked provider for the same reason).
+static void stream_query(xsql_http_server *s, struct mg_connection *conn,
+                         const char *sql, const xsql_script_opts *opts,
+                         bool ndjson) {
+    const char *ctype = ndjson ? "application/x-ndjson" : "application/json";
+    // Output chain: executor -> coalescer -> [gzip encoder ->] chunk frames.
+    // The gzip encoder sits after the coalescer so it sees 64 KiB batches, not
+    // one call per row.
+    xsql_stream_sink_fn real_write = send_chunk_frames;
+    void *real_user = conn;
+#ifdef XSQLC_HAS_GZIP
+    xsqlc_gzip *gz = NULL;
+    if (wants_gzip(conn, ctype)) {
+        if (xsqlc_gzip_new(send_chunk_frames, conn, &gz) != XSQL_OK) {
+            send_json_err(conn, 500, "Out of memory");
+            return;
+        }
+        real_write = xsqlc_gzip_sink;
+        real_user = gz;
+    }
+#endif
+    xsql_stream_coalescer *co = NULL;
+    if (xsql_stream_coalescer_new(real_write, real_user,
+                                  XSQL_STREAM_COALESCE_BYTES, &co) != XSQL_OK) {
+#ifdef XSQLC_HAS_GZIP
+        xsqlc_gzip_free(gz);
+#endif
+        send_json_err(conn, 500, "Out of memory");
+        return;
+    }
+    const bool gzip = real_write != send_chunk_frames;
+    mg_printf(conn,
+              "HTTP/1.1 200 OK\r\n"
+              "Content-Type: %s\r\n"
+              "%s"
+              "Transfer-Encoding: chunked\r\n"
+              "\r\n",
+              ctype,
+              gzip ? "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n" : "");
+    s->stream_executor(sql, opts, ndjson, xsql_stream_coalescer_sink, co,
+                       s->stream_user);
+    bool ok = xsql_stream_coalescer_flush(co);
+#ifdef XSQLC_HAS_GZIP
+    if (ok && gz) {
+        ok = xsqlc_gzip_finish(gz);
+    }
+#endif
+    // The terminating chunk only follows a complete body; a stream that failed
+    // part way ends without it, so the client sees a truncated response rather
+    // than a short one that looks whole.
+    if (ok) {
+        mg_write(conn, "0\r\n\r\n", 5);
+    }
+    xsql_stream_coalescer_free(co);
+#ifdef XSQLC_HAS_GZIP
+    xsqlc_gzip_free(gz);
+#endif
 }
 
 static void handle_query(xsql_http_server *s, struct mg_connection *conn,
@@ -1012,19 +1215,21 @@ static void handle_query(xsql_http_server *s, struct mg_connection *conn,
         }
     }
 
-    // Output format (default json); an unrecognized value is a 400.
+    // Output format (default json); an unrecognized value is a 400. A value too
+    // long for the buffer is unrecognized too, never a silent fallback to json.
     char fbuf[32];
     const char *format = "json";
-    if (get_param(ri, "format", fbuf, sizeof(fbuf)) && fbuf[0]) {
+    enum param_result fres = lookup_param(ri, "format", fbuf, sizeof(fbuf));
+    if (fres == PARAM_TOO_LONG || (fres == PARAM_FOUND && fbuf[0])) {
         format = fbuf;
-        if (strcmp(format, "json") != 0 && strcmp(format, "text") != 0 &&
-            strcmp(format, "csv") != 0 && strcmp(format, "tsv") != 0) {
+        if (fres == PARAM_TOO_LONG || !is_known_format(format)) {
             const char *msg;
             xsqlc_strbuf mb;
             xsqlc_sb_init(&mb);
             xsqlc_sb_append(&mb, "unrecognized ?format '");
-            xsqlc_sb_append(&mb, format);
-            xsqlc_sb_append(&mb, "' (expected json, text, csv, or tsv)");
+            xsqlc_sb_append(&mb, fres == PARAM_TOO_LONG ? "<too long>" : format);
+            xsqlc_sb_append(&mb,
+                            "' (expected json, jsonl, text, csv, or tsv)");
             msg = xsqlc_sb_oom(&mb) ? NULL : xsqlc_sb_cstr(&mb);
             send_json_err(conn, 400, msg ? msg : "unrecognized ?format");
             xsqlc_sb_free(&mb);
@@ -1089,10 +1294,61 @@ static void handle_query(xsql_http_server *s, struct mg_connection *conn,
     if (json_incl) {
         opts.include_sql = true;
     }
+    apply_timeout_header(conn, &opts);
+
+    // Real chunked streaming: only with a stream executor, only outside queue
+    // mode, and only when the client opts in. Everyone else falls through to
+    // the buffered dispatch below unchanged.
+    bool stream_ndjson = false;
+    if (s->stream_executor && !s->use_queue &&
+        stream_requested(conn, &stream_ndjson)) {
+        // The stream only knows two shapes: the JSON envelope, and NDJSON
+        // (which is what ?format=jsonl asks for). Taking the stream anyway
+        // would hand csv/tsv/text (or jsonl under a non-ndjson header) a JSON
+        // body with no sign its format was ignored, so reject it before the
+        // executor runs, like any unrecognized ?format.
+        const bool format_matches_stream =
+            strcmp(format, "json") == 0 ||
+            (strcmp(format, "jsonl") == 0 && stream_ndjson);
+        if (!format_matches_stream) {
+            const char *hdr = mg_get_header(conn, "X-XSQL-Stream");
+            xsqlc_strbuf mb;
+            xsqlc_sb_init(&mb);
+            xsqlc_sb_append(&mb, "?format=");
+            xsqlc_sb_append(&mb, format);
+            xsqlc_sb_append(&mb, " is incompatible with X-XSQL-Stream: ");
+            xsqlc_sb_append(&mb, hdr ? hdr : "");
+            xsqlc_sb_append(&mb,
+                            " (streaming only supports json, or jsonl with "
+                            "X-XSQL-Stream: ndjson -- drop ?format= or "
+                            "X-XSQL-Stream to use the other)");
+            send_json_err(conn, 400,
+                          xsqlc_sb_oom(&mb)
+                              ? "?format= is incompatible with X-XSQL-Stream"
+                              : xsqlc_sb_cstr(&mb));
+            xsqlc_sb_free(&mb);
+            xsqlc_free(sql);
+            if (gate_held) {
+                gate_release(s);
+            }
+            return;
+        }
+        // Re-arm the /cancel snapshot at execution start, so a cancel that
+        // arrived while this request waited at the serialize gate is not
+        // collateral.
+        request_cancel.epoch = cancel_epoch_snapshot(s);
+        stream_query(s, conn, sql, &opts, stream_ndjson);
+        xsqlc_free(sql);
+        if (gate_held) {
+            gate_release(s);
+        }
+        return;
+    }
 
     // Executor precedence: script > statement > query_fn.
     if (s->script_executor) {
         xsql_script_result *r = NULL;
+        request_cancel.epoch = cancel_epoch_snapshot(s);  // execution starts now
         int rc = s->script_executor(sql, &opts, &r, s->script_executor_user);
         if (rc != XSQL_OK || !r) {
             xsql_script_result_free(r);
@@ -1182,6 +1438,33 @@ static void handle_cancel(xsql_http_server *s, struct mg_connection *conn) {
     xsqlc_mtx_lock(s->cancel_mtx);
     ++s->cancel_epoch;
     xsqlc_mtx_unlock(s->cancel_mtx);
+    // Forward to the downstream hook only after the local epoch moved, so the
+    // local query stops whether or not propagation succeeds. A failure is a 502:
+    // answering 200 would tell the client the whole chain was cancelled when
+    // only the local epoch moved.
+    if (s->cancel_fn) {
+        char err[512];
+        err[0] = '\0';
+        if (s->cancel_fn(err, sizeof(err), s->cancel_user) != 0) {
+            err[sizeof(err) - 1] = '\0';
+            xsqlc_strbuf mb;
+            xsqlc_sb_init(&mb);
+            xsqlc_sb_append(&mb,
+                            "local cancellation requested, but downstream "
+                            "propagation failed");
+            if (err[0]) {
+                xsqlc_sb_append(&mb, ": ");
+                xsqlc_sb_append(&mb, err);
+            }
+            send_json_err(conn, 502,
+                          xsqlc_sb_oom(&mb)
+                              ? "local cancellation requested, but downstream "
+                                "propagation failed"
+                              : xsqlc_sb_cstr(&mb));
+            xsqlc_sb_free(&mb);
+            return;
+        }
+    }
     send_json(conn, 200,
               "{\"success\":true,\"message\":\"cancel requested\"}");
 }
@@ -1417,17 +1700,20 @@ int xsql_http_server_new(const xsql_http_server_config *cfg,
     s->use_queue = cfg->use_queue;
     s->serialize_requests = cfg->serialize_requests;
     s->status_requires_auth =
-        cfg->struct_size >= offsetof(xsql_http_server_config,
-                                     status_requires_auth) +
-                                sizeof(cfg->status_requires_auth)
+        XSQLC_CFG_HAS(cfg, status_requires_auth)
             ? cfg->status_requires_auth != XSQL_HTTP_STATUS_AUTH_PUBLIC
             : true;
     s->max_request_body_bytes =
-        cfg->struct_size >= offsetof(xsql_http_server_config,
-                                     max_request_body_bytes) +
-                                sizeof(cfg->max_request_body_bytes)
-            ? cfg->max_request_body_bytes
-            : 0;
+        XSQLC_CFG_HAS(cfg, max_request_body_bytes) ? cfg->max_request_body_bytes
+                                                   : 0;
+    if (XSQLC_CFG_HAS(cfg, cancel_user)) {
+        s->cancel_fn = cfg->cancel_fn;
+        s->cancel_user = cfg->cancel_user;
+    }
+    if (XSQLC_CFG_HAS(cfg, stream_user)) {
+        s->stream_executor = cfg->stream_executor;
+        s->stream_user = cfg->stream_user;
+    }
     s->interrupt_fn = NULL;
 
     bool ok = copy_opt(&s->tool_name, cfg->tool_name ? cfg->tool_name : "xsql") &&
@@ -1552,19 +1838,38 @@ int xsql_http_server_start(xsql_http_server *s) {
         ncand = 901;
     }
 
+    // civetweb's listening spec takes an IPv6 address bracketed ("[::1]:8100",
+    // "[::]:8100"); xsql_format_url_host brackets one and maps an empty bind to
+    // 127.0.0.1, the same rendering url() reports.
+    char *spec_host = xsql_format_url_host(s->bind_address);
+    if (!spec_host) {
+        return -1;
+    }
     for (int i = 0; i < ncand; ++i) {
         char ports[128];
-        int need = snprintf(ports, sizeof(ports), "%s:%d", s->bind_address,
+        int need = snprintf(ports, sizeof(ports), "%s:%d", spec_host,
                             candidates[i]);
         if (need < 0 || (size_t)need >= sizeof(ports)) {
             // A caller-supplied bind_address too long for the buffer would be
             // silently truncated and bind to a wrong/garbage listening spec —
             // fail the bind instead. (Address is loop-invariant, so this fails
             // once for every candidate; -1 aborts start cleanly.)
+            xsqlc_free(spec_host);
             return -1;
         }
+        // Keep-alive (C++ 736d023 raised httplib's 5-request ceiling for batch
+        // clients issuing many small queries). civetweb has no per-connection
+        // request cap at all, so a connection serves requests until the client
+        // closes it, sends Connection: close, idles past keep_alive_timeout_ms
+        // (civetweb's 500 ms default), or leaves a request body unread (the 413
+        // path), which makes civetweb close. Every response here is framed by
+        // Content-Length or chunked encoding, which keep-alive requires. An idle
+        // kept-alive connection does not delay stop(): mg_stop() returns within
+        // one SOCKET_TIMEOUT_QUANTUM (200 ms), unlike httplib, whose stop waits
+        // out the idle timeout (the reason C++ bounded the count, not the idle
+        // time).
         const char *opts[] = {"listening_ports", ports, "num_threads", "32",
-                              NULL};
+                              "enable_keep_alive", "yes", NULL};
         struct mg_context *ctx = mg_start(NULL, NULL, opts);
         if (!ctx) {
             continue;
@@ -1580,14 +1885,19 @@ int xsql_http_server_start(xsql_http_server *s) {
             }
             bound_port = server_port.port;
         }
-        mg_set_request_handler(ctx, "/", dispatch, s);
+        // Admit queries before any route can answer: until the handler is set
+        // civetweb answers 404, so a client that sees GET /status succeed never
+        // has its next /query refused with "Server not running".
         xsqlc_mtx_lock(s->state_mtx);
         s->ctx = ctx;
         s->port = bound_port;
         s->running = true;
         xsqlc_mtx_unlock(s->state_mtx);
+        mg_set_request_handler(ctx, "/", dispatch, s);
+        xsqlc_free(spec_host);
         return bound_port;
     }
+    xsqlc_free(spec_host);
     return -1;
 }
 
@@ -1667,10 +1977,15 @@ char *xsql_http_server_url(const xsql_http_server *s) {
     xsqlc_mtx_lock(m->state_mtx);
     int port = m->port;
     xsqlc_mtx_unlock(m->state_mtx);
+    char *host = xsql_format_url_host(m->bind_address);  // "::1" => "[::1]"
+    if (!host) {
+        return NULL;
+    }
     xsqlc_strbuf sb;
     xsqlc_sb_init(&sb);
     xsqlc_sb_append(&sb, "http://");
-    xsqlc_sb_append(&sb, m->bind_address ? m->bind_address : "127.0.0.1");
+    xsqlc_sb_append(&sb, host);
+    xsqlc_free(host);
     xsqlc_sb_putc(&sb, ':');
     xsqlc_sb_append_i64(&sb, port);
     if (xsqlc_sb_oom(&sb)) {

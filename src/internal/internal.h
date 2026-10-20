@@ -18,6 +18,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // Forward declarations so this header never forces <sqlite3.h> on its includers.
 struct sqlite3;
@@ -80,6 +81,15 @@ typedef struct {
     size_t writable_column_cap;
 } xsqlc_write_surface;
 
+// One cached-table module registration on one connection: the sqlite3 module's
+// client data (so xCreate/xConnect reach `def`) and the entry that
+// xsql_db_invalidate_cached_tables() walks. Freed by the module destructor,
+// which SQLite runs when it drops the module (re-registration, xsql_close).
+typedef struct xsqlc_cached_binding {
+    const struct xsql_cached_table *def;    // borrowed; caller-owned
+    struct xsql_db                 *owner;  // NULL once the connection is gone
+} xsqlc_cached_binding;
+
 struct xsql_db {
     struct sqlite3 *db;          // NULL once closed
     char           *last_error;  // heap (xsqlc); NULL means "" (no error)
@@ -92,7 +102,23 @@ struct xsql_db {
     bool                 preparing_drop;
     size_t               preparing_drop_index;
     struct xsql_db      *registry_next;
+    // Every live cached-table module registration on this connection (see
+    // xsqlc_cached_binding). Guarded by the connection's own mutex.
+    xsqlc_cached_binding **cached_bindings;
+    size_t                 cached_binding_count;
+    size_t                 cached_binding_cap;
+    // Innermost guarded xsql_db_query* call running on this connection (a
+    // query nested in it links to it and stays inside its budget). result.c.
+    struct xsqlc_query_budget *active_query;
+    // Row writes accepted by this connection's counting virtual tables
+    // (xsql_db_vtab_write_count). Bumped and read under the connection mutex.
+    uint64_t               vtab_write_count;
 };
+
+// Record one accepted virtual-table row write on `owner` (no-op when the table
+// opted out with counts_as_write(false), or when there is no owner). Called by
+// the index/cached/generator xUpdate paths after a successful write.
+void xsqlc_note_vtab_write(struct xsql_db *owner, bool counts_as_write);
 
 // Concrete write surfaces are tracked by successful xCreate/xConnect/xDestroy
 // callbacks, so raw/qualified SQL and persistent reconnects are covered too.
@@ -104,6 +130,13 @@ int xsqlc_db_record_writable_column(struct xsql_db *db, const char *schema,
                                     const char *table, const char *column);
 void xsqlc_db_remove_write_surface(struct xsql_db *db, const char *schema,
                                    const char *table);
+
+// Cached-table registration bookkeeping (database.c). Add returns an
+// xsql_status; remove is a no-op for an unknown binding.
+int xsqlc_db_add_cached_binding(struct xsql_db *db,
+                                xsqlc_cached_binding *binding);
+void xsqlc_db_remove_cached_binding(struct xsql_db *db,
+                                    const xsqlc_cached_binding *binding);
 
 struct xsql_stmt {
     struct sqlite3_stmt *stmt;       // NULL once finalized

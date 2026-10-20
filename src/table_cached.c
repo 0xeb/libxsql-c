@@ -47,6 +47,21 @@
     (XSQLC_RANGE_HAS_LOW | XSQLC_RANGE_LOW_STRICT | XSQLC_RANGE_HAS_HIGH |      \
      XSQLC_RANGE_HIGH_STRICT)
 
+// Multi-column / multi-operator constraint filters (xsql_cached_constraint_
+// filter / _cache_filter): idxNum = CT_CONSTRAINT_FILTER_BASE + position, with
+// the matched spec positions in idxStr. The range encoding above is open ended
+// by design, so this space sits far above it and xFilter tests it first.
+#define CT_CONSTRAINT_FILTER_BASE 1000000
+
+// index_on's ceiling: the equality space (CT_INDEX_BASE + pos) ends where the
+// range space begins. A silent overlap would dispatch one plan's idxNum to
+// another plan's decoder and return wrong rows, so the bound is enforced at
+// registration, and checked here against the constraint-filter space too.
+#define CT_MAX_INDEXES (CT_RANGE_BASE - CT_INDEX_BASE)
+_Static_assert(CT_RANGE_BASE + CT_MAX_INDEXES * CT_RANGE_STRIDE <
+                   CT_CONSTRAINT_FILTER_BASE,
+               "the range idxNum space must end below the constraint-filter base");
+
 // ---------------------------------------------------------------------------
 // Wrappers
 // ---------------------------------------------------------------------------
@@ -71,6 +86,12 @@ typedef struct {
 
     rowbuf cache;        // non-shared fallback
     bool   cache_built;
+    // Key of the full-scan `cache` above. Cursor-lived like index_cache: reused
+    // across this cursor's xFilter calls (a JOIN's inner loop re-filters one
+    // cursor per outer row) while the projection and the table's write
+    // generation both still match. A new statement opens a new cursor.
+    uint64_t cache_col_used;
+    uint64_t cache_generation;
     size_t current_row;
 
     xsql_row_iter iter;
@@ -100,6 +121,7 @@ typedef struct {
     xsqlc_i64map        *cursor_indexes;
     size_t               n_cursor_indexes;
     bool                 cursor_index_built;
+    uint64_t             index_generation;  // write generation index_cache was built at
     // Parallel sorted views for range pushdown on a query-scoped table, one slot
     // per index, built lazily on the first range query against this cursor and
     // reused thereafter (like cursor_indexes). Dropped with the cursor.
@@ -191,16 +213,90 @@ static bool has_cache_builder(const xsql_cached_table *def) {
     return def->cache_builder_fn || def->stateful_cache_builder_fn;
 }
 
-static bool query_scoped_uses_mutation_snapshot(const xsql_cached_table *def) {
-    return !def->use_shared_cache && !def->lookup_fn && !def->rowid_fn &&
-           def->nfilters == 0 && has_cache_builder(def) &&
-           has_scan_driven_mutation(def);
+// Factory-backed constraint filters stream iterator rows, whose rowids (like a
+// single-column filter's) need not be cache positions.
+static bool has_factory_constraint_filter(const xsql_cached_table *def) {
+    for (size_t i = 0; i < def->nconstr; ++i) {
+        if (def->constraints[i].factory) {
+            return true;
+        }
+    }
+    return false;
 }
 
+static bool query_scoped_uses_mutation_snapshot(const xsql_cached_table *def) {
+    return !def->use_shared_cache && !def->lookup_fn && !def->rowid_fn &&
+           def->nfilters == 0 && !has_factory_constraint_filter(def) &&
+           has_cache_builder(def) && has_scan_driven_mutation(def);
+}
+
+// Reconstruct-by-rowid, and thus NOCHANGE-eligible (cached_xcolumn gates on this
+// very predicate): a POSITIONAL shared-cache index (no rowid_fn), a lookup_fn
+// (the sole authority: a rowid it cannot resolve fails the write), or the
+// query-scoped mutation snapshot -- never when opted out.
 static bool reconstruct_by_rowid(const xsql_cached_table *def) {
     return !def->update_from_column_values &&
            (((!def->rowid_fn) && def->use_shared_cache) || def->lookup_fn != NULL ||
             query_scoped_uses_mutation_snapshot(def));
+}
+
+// Row identity. A cached table that sets a lookup_fn must also set a rowid_fn,
+// so that every rowid its scans report is a KEY: filter iterators report their
+// own key, full and index scans report rowid_fn(row). lookup_fn is then the only
+// thing UPDATE, DELETE and `WHERE rowid = ?` use to turn a rowid back into a
+// row. Without rowid_fn a full scan would report a cache POSITION, and a
+// position read as a key can name a different, existing row (keys 0..N collide
+// with positions 0..N). Enforced at registration (create_cached_module).
+static bool cached_identity_ok(const xsql_cached_table *def) {
+    return !def->lookup_fn || def->rowid_fn;
+}
+
+// Fail an UPDATE/DELETE whose rowid names no row, keeping a reason a callback
+// already set.
+static int cached_row_not_found(CachedVtab *vtab, int64_t rowid) {
+    if (!xsqlc_vtab_has_error()) {
+        xsql_vtab_set_error("row %lld not found in %s", (long long)rowid,
+                            vtab->def->name);
+    }
+    return xsqlc_vtab_return_error(&vtab->base);
+}
+
+// Resolve an UPDATE/DELETE rowid through lookup_fn, the sole authority for a
+// table that has one. On failure the vtab error holds lookup_fn's own reason,
+// or "row <id> not found in <table>".
+static bool cached_row_lookup_or_error(const xsql_cached_table *def,
+                                       int64_t rowid, void *out) {
+    xsqlc_vtab_clear_error();
+    if (def->lookup_fn(out, rowid, def->lookup_user)) {
+        return true;
+    }
+    if (!xsqlc_vtab_has_error()) {
+        xsql_vtab_set_error("row %lld not found in %s", (long long)rowid,
+                            def->name);
+    }
+    return false;
+}
+
+// `WHERE rowid = ?` over a materialization, for a table WITHOUT a lookup_fn:
+// match by KEY (rowid_fn, any sign) when the table has one, else by cache
+// position. Copies the row into `out`; returns whether one matched.
+static bool pick_rowid_row(const xsql_cached_table *def, const rowbuf *rows,
+                           int64_t rowid, void *out) {
+    if (def->rowid_fn) {
+        for (size_t i = 0; i < rows->count; ++i) {
+            const void *row = xsqlc_rowbuf_at(rows, i);
+            if (def->rowid_fn(row, def->rowid_user) == rowid) {
+                memcpy(out, row, def->row_size);
+                return true;
+            }
+        }
+        return false;
+    }
+    if (rowid >= 0 && (uint64_t)rowid < (uint64_t)rows->count) {
+        memcpy(out, xsqlc_rowbuf_at(rows, (size_t)rowid), def->row_size);
+        return true;
+    }
+    return false;
 }
 
 static void invoke_cache_builder(const xsql_cached_table *def,
@@ -227,8 +323,16 @@ static void column_emit(const cached_column *c, xsql_context *ctx,
 
 static bool column_set(const cached_column *c, void *row, xsql_value *val) {
     switch (c->set_kind) {
-        case CSET_I64:  return c->set.i64(row, xsql_value_i64(val), c->user);
-        case CSET_INT:  return c->set.i(row, xsql_value_int(val), c->user);
+        case CSET_I64: {
+            int64_t v = 0;
+            return xsqlc_exact_setter_int64((sqlite3_value *)val, c->name, &v) &&
+                   c->set.i64(row, v, c->user);
+        }
+        case CSET_INT: {
+            int v = 0;
+            return xsqlc_exact_setter_int((sqlite3_value *)val, c->name, &v) &&
+                   c->set.i(row, v, c->user);
+        }
         case CSET_TEXT: {
             const char *tx = xsql_value_text(val);
             return c->set.text(row, tx ? tx : "", c->user);
@@ -321,7 +425,8 @@ static int cached_connect(sqlite3 *db, void *pAux, int argc,
                           const char *const *argv, sqlite3_vtab **ppVtab,
                           char **pzErr) {
     (void)pzErr;
-    const xsql_cached_table *def = (const xsql_cached_table *)pAux;
+    const xsqlc_cached_binding *binding = (const xsqlc_cached_binding *)pAux;
+    const xsql_cached_table *def = binding ? binding->def : NULL;
     if (!def || argc < 3 || !argv[1] || !argv[2]) {
         return SQLITE_MISUSE;
     }
@@ -507,10 +612,8 @@ static int cached_xcolumn(sqlite3_vtab_cursor *pCursor, sqlite3_context *ctx,
     const xsql_cached_table *def = cur->def;
 
     // NOCHANGE is honored only when the row can be reconstructed from the rowid
-    // alone (must match cached_update's reconstruct_by_rowid) — A7.
-    if (sqlite3_vtab_nochange(ctx) && !def->update_from_column_values &&
-        (((!def->rowid_fn) && def->use_shared_cache) || def->lookup_fn ||
-         query_scoped_uses_mutation_snapshot(def))) {
+    // alone: the very predicate cached_update reconstructs by — A7.
+    if (sqlite3_vtab_nochange(ctx) && reconstruct_by_rowid(def)) {
         return SQLITE_OK;
     }
 
@@ -569,6 +672,7 @@ static int cached_rowid(sqlite3_vtab_cursor *pCursor, sqlite3_int64 *pRowid) {
         // Rowid honors rowid_fn; else the matched cache POSITION (row_idx), NOT
         // cur->current_row (the index path does not advance it), matching the
         // full-scan path so positional/lookup reconstruction resolves the same row.
+        // A lookup_fn table always has a rowid_fn, so it reports a key here.
         if (cur->index_matches && cur->index_pos < cur->index_matches->count) {
             size_t row_idx = cur->index_matches->items[cur->index_pos];
             if (def->rowid_fn) {
@@ -608,9 +712,27 @@ static void cached_reset_cursor(CachedCursor *cur) {
     xsqlc_poslist_clear(&cur->range_matches);
     cur->using_count_only = false;
     cur->count_only_total = 0;
-    xsqlc_rowbuf_clear(&cur->cache);
-    cur->cache_built = false;
     cur->current_row = 0;
+    // `cache` and `index_cache` are deliberately NOT cleared here: both are
+    // cursor-lived and reused across this cursor's xFilter calls. Only a write
+    // through the table since they were built invalidates them.
+    if (cur->cursor_index_built &&
+        cur->index_generation != xsqlc_cache_write_generation(cur->def)) {
+        xsqlc_rowbuf_clear(&cur->index_cache);
+        for (size_t i = 0; i < cur->n_cursor_indexes; ++i) {
+            xsqlc_i64map_free(&cur->cursor_indexes[i]);
+        }
+        xsqlc_free(cur->cursor_indexes);
+        cur->cursor_indexes = NULL;
+        cur->n_cursor_indexes = 0;
+        for (size_t i = 0; i < cur->n_cursor_sorted; ++i) {
+            xsqlc_sorted_index_free(&cur->cursor_sorted_indexes[i]);
+        }
+        xsqlc_free(cur->cursor_sorted_indexes);
+        cur->cursor_sorted_indexes = NULL;
+        cur->n_cursor_sorted = 0;
+        cur->cursor_index_built = false;
+    }
 }
 
 // Build (once, lazily) a connection-local snapshot of the pre-mutation rows so
@@ -658,6 +780,7 @@ static bool build_cursor_index(CachedCursor *cur) {
         return true;
     }
     xsqlc_rowbuf_clear(&cur->index_cache);
+    cur->index_generation = xsqlc_cache_write_generation(def);
     struct xsql_rowset rs = {&cur->index_cache};
     CachedVtab *vtab = (CachedVtab *)cur->base.pVtab;
     invoke_cache_builder(def, vtab, &rs);
@@ -701,6 +824,259 @@ static bool build_cursor_index(CachedCursor *cur) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Constraint filters (xsql_cached_constraint_filter / _cache_filter)
+// ---------------------------------------------------------------------------
+
+static const cached_constraint_filter *find_constraint_filter(
+    const xsql_cached_table *def, int idxNum) {
+    for (size_t i = 0; i < def->nconstr; ++i) {
+        if (def->constraints[i].filter_id == idxNum) {
+            return &def->constraints[i];
+        }
+    }
+    return NULL;
+}
+
+// Three-way compare of an integer key with a double, exact over the whole
+// int64 range (a plain (double)key would round keys past 2^53).
+static int int_float_cmp(int64_t key, double d) {
+    if (d < -9223372036854775808.0) {
+        return 1;
+    }
+    if (d >= 9223372036854775808.0) {
+        return -1;
+    }
+    int64_t di = (int64_t)d;  // truncates toward zero; in range here
+    if (key != di) {
+        return key < di ? -1 : 1;
+    }
+    double frac = d - (double)di;
+    return frac > 0.0 ? -1 : (frac < 0.0 ? 1 : 0);
+}
+
+static bool key_satisfies(int64_t key, xsql_constraint_op op,
+                          const xsqlc_cmp_value *v) {
+    int c;
+    switch (v->kind) {
+        case SQLITE_NULL:
+            return false;
+        case SQLITE_INTEGER:
+            c = key < v->i ? -1 : (key > v->i ? 1 : 0);
+            break;
+        case SQLITE_FLOAT:
+            c = int_float_cmp(key, v->d);
+            break;
+        default:
+            c = -1;  // text and blobs sort after every number
+            break;
+    }
+    switch (op) {
+        case XSQL_CONSTRAINT_EQ: return c == 0;
+        case XSQL_CONSTRAINT_GT: return c > 0;
+        case XSQL_CONSTRAINT_GE: return c >= 0;
+        case XSQL_CONSTRAINT_LT: return c < 0;
+        case XSQL_CONSTRAINT_LE: return c <= 0;
+        case XSQL_CONSTRAINT_LIKE:
+        default:
+            // Rejected by xsql_cached_constraint_cache_filter at registration.
+            return false;
+    }
+}
+
+// The integer key an equality index lookup should probe for `v`, or false when
+// no integer key can equal it (NULL, a non-integral or out-of-range real,
+// non-numeric text, a blob). The index plan is omit=1, so the lookup must be
+// exact: reading the value with sqlite3_value_int64 turned NULL and 'a' into 0
+// and 2.5 into 2, and matched rows SQLite would not.
+static bool eq_lookup_key(sqlite3_value *v, int64_t *key, bool *oom) {
+    xsqlc_cmp_value cv;
+    *oom = false;
+    if (!xsqlc_resolve_cmp_value(v, &cv)) {
+        *oom = true;
+        return false;
+    }
+    return xsqlc_cmp_exact_key(&cv, key);
+}
+
+// A range bound normalized to an integer bound with the same meaning over
+// integer keys (see xsqlc_cmp_bound). BOUND_OOM: the value's private copy
+// could not be allocated.
+enum { BOUND_OOM = -1 };
+
+static int normalize_bound(sqlite3_value *v, bool is_low, bool *strict,
+                           int64_t *bound) {
+    xsqlc_cmp_value cv;
+    if (!xsqlc_resolve_cmp_value(v, &cv)) {
+        return BOUND_OOM;
+    }
+    return xsqlc_cmp_bound(&cv, is_low, strict, bound);
+}
+
+typedef struct {
+    const cached_index_def *index;  // supplies the row's key
+    xsql_constraint_op      op;
+    xsqlc_cmp_value         value;
+} cache_predicate;
+
+static bool row_matches(const void *row, const cache_predicate *preds,
+                        int npreds) {
+    for (int i = 0; i < npreds; ++i) {
+        int64_t key = preds[i].index->key(row, preds[i].index->user);
+        if (!key_satisfies(key, preds[i].op, &preds[i].value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Evaluate a cache-backed constraint filter over the table's own rows into the
+// cursor's index window. Shared tables read the engine-lifetime cache and copy
+// the matching rows under its mutex (a concurrent invalidation reallocates the
+// shared rows); query-scoped tables use the cursor-lived build.
+static int run_cache_constraint(CachedCursor *cur, const cache_predicate *preds,
+                                int npreds) {
+    const xsql_cached_table *def = cur->def;
+    xsqlc_poslist_clear(&cur->range_matches);
+    if (def->use_shared_cache) {
+        if (!xsqlc_cache_ensure_built(def)) {
+            return xsqlc_vtab_return_error(cur->base.pVtab);
+        }
+        shared_cache *shared = def->shared;
+        bool oom = false;
+        sqlite3_mutex_enter(shared->mutex);
+        xsqlc_rowbuf_clear(&cur->index_row_copy);
+        if (shared->built) {
+            for (size_t row = 0; row < shared->data.count && !oom; ++row) {
+                const void *r = xsqlc_rowbuf_at(&shared->data, row);
+                if (!row_matches(r, preds, npreds)) {
+                    continue;
+                }
+                oom = !xsqlc_poslist_push(&cur->range_matches,
+                                          cur->index_row_copy.count) ||
+                      !xsqlc_rowbuf_push(&cur->index_row_copy, r);
+            }
+        }
+        sqlite3_mutex_leave(shared->mutex);
+        if (oom) {
+            xsqlc_poslist_clear(&cur->range_matches);
+            xsql_vtab_set_error("out of memory");
+            return xsqlc_vtab_return_error(cur->base.pVtab);
+        }
+        cur->index_data_source = &cur->index_row_copy;
+    } else {
+        if (!build_cursor_index(cur)) {
+            return xsqlc_vtab_return_error(cur->base.pVtab);
+        }
+        for (size_t row = 0; row < cur->index_cache.count; ++row) {
+            if (row_matches(xsqlc_rowbuf_at(&cur->index_cache, row), preds,
+                            npreds) &&
+                !xsqlc_poslist_push(&cur->range_matches, row)) {
+                xsqlc_poslist_clear(&cur->range_matches);
+                xsql_vtab_set_error("out of memory");
+                return xsqlc_vtab_return_error(cur->base.pVtab);
+            }
+        }
+        cur->index_data_source = &cur->index_cache;
+    }
+    cur->using_index = true;
+    cur->index_matches = &cur->range_matches;
+    cur->index_pos = 0;
+    return SQLITE_OK;
+}
+
+static int run_constraint_filter(CachedCursor *cur,
+                                 const cached_constraint_filter *cf,
+                                 const char *idxStr, int argc,
+                                 sqlite3_value **argv) {
+    const xsql_cached_table *def = cur->def;
+    xsql_constraint_arg *args =
+        (xsql_constraint_arg *)xsqlc_malloc(sizeof(*args) * (size_t)argc);
+    cache_predicate *preds =
+        cf->factory ? NULL
+                    : (cache_predicate *)xsqlc_malloc(sizeof(*preds) * (size_t)argc);
+    if (!args || (!cf->factory && !preds)) {
+        xsqlc_free(args);
+        xsqlc_free(preds);
+        return SQLITE_NOMEM;
+    }
+    // idxStr lists, in argv order, the spec each argument belongs to.
+    // xBestIndex marked every one omit=1, so SQLite does not re-check them: an
+    // undecodable position must fail the query, never be skipped (skipping
+    // widens the result: wrong rows, no error).
+    int n = 0;
+    const char *p = idxStr;
+    while (p && *p && n < argc) {
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) {
+            break;
+        }
+        if (v < 0 || (unsigned long)v >= cf->nspecs) {
+            xsqlc_free(args);
+            xsqlc_free(preds);
+            xsql_vtab_set_error(
+                "constraint filter argument %d maps to out-of-range spec index "
+                "%ld on table '%s'",
+                n, v, def->name);
+            return xsqlc_vtab_return_error(cur->base.pVtab);
+        }
+        const cached_constraint_spec *spec = &cf->specs[v];
+        args[n].column_index = spec->column_index;
+        args[n].op = spec->op;
+        args[n].value = (xsql_value *)argv[n];
+        if (preds) {
+            int pos = find_index(def, spec->column_index);
+            if (pos < 0 || !xsqlc_resolve_cmp_value(argv[n], &preds[n].value)) {
+                xsqlc_free(args);
+                xsqlc_free(preds);
+                if (pos >= 0) {
+                    return SQLITE_NOMEM;
+                }
+                xsql_vtab_set_error("constraint filter column has no index on "
+                                    "table '%s'",
+                                    def->name);
+                return xsqlc_vtab_return_error(cur->base.pVtab);
+            }
+            preds[n].index = &def->index_defs[pos];
+            preds[n].op = spec->op;
+        }
+        n++;
+        p = (*end == ',') ? end + 1 : end;
+    }
+    if (n != argc || (p && *p)) {
+        xsqlc_free(args);
+        xsqlc_free(preds);
+        xsql_vtab_set_error("internal constraint filter plan mismatch on table '%s'",
+                            def->name);
+        return xsqlc_vtab_return_error(cur->base.pVtab);
+    }
+
+    int rc = SQLITE_OK;
+    xsqlc_vtab_clear_error();
+    if (cf->factory) {
+        // Factory-backed: the source resolves the predicate exactly and streams
+        // only the matching rows. Nothing is materialized here.
+        cur->using_iterator = true;
+        cur->iterator_eof = true;
+        xsql_row_iter it;
+        memset(&it, 0, sizeof(it));
+        if (cf->factory(argc, args, &it, cf->user)) {
+            cur->iter = it;
+            cur->has_iter = true;
+            cur->iterator_eof = !cur->iter.next(cur->iter.self);
+        }
+        if (xsqlc_vtab_has_error()) {
+            rc = xsqlc_vtab_return_error(cur->base.pVtab);
+        }
+    } else {
+        rc = run_cache_constraint(cur, preds, argc);
+    }
+    xsqlc_free(args);
+    xsqlc_free(preds);
+    return rc;
+}
+
 static int cached_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
                           const char *idxStr, int argc, sqlite3_value **argv) {
     CachedCursor *cur = (CachedCursor *)pCursor;
@@ -729,57 +1105,73 @@ static int cached_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
                 cur->rowid_lookup_eof = true;
                 return SQLITE_OK;
             }
-            int64_t raw = sqlite3_value_int64(argv[0]);
+            // omit=1: only a value an integer rowid can equal finds a row
+            // (rowid = 1.5 or rowid = 'a' must not read as 1 or 0).
+            int64_t raw = -1;
+            bool oom = false;
+            const bool exact = eq_lookup_key(argv[0], &raw, &oom);
+            if (oom) {
+                xsql_vtab_set_error("out of memory");
+                return xsqlc_vtab_return_error(pCursor->pVtab);
+            }
             cur->using_rowid_lookup = true;
-            cur->rowid_lookup_id = raw;
+            cur->rowid_lookup_id = exact ? raw : 0;
             cur->rowid_lookup_eof = true;
-            if (raw >= 0) {
+            if (exact) {
                 xsqlc_vtab_clear_error();
-                bool found = false;
                 if (def->lookup_fn) {
-                    found = def->lookup_fn(cur->rowid_lookup_row, raw,
-                                           def->lookup_user);
-                    cur->rowid_lookup_eof = !found;
-                }
-                if (!found) {
-                    if (def->use_shared_cache) {
-                        if (!xsqlc_cache_ensure_built(def)) {
-                            return xsqlc_vtab_return_error(pCursor->pVtab);
-                        }
-                        shared_cache *shared = def->shared;
-                        size_t rid = (size_t)raw;
-                        if (shared->built && rid < shared->data.count) {
-                            memcpy(cur->rowid_lookup_row,
-                                   xsqlc_rowbuf_at(&shared->data, rid),
-                                   def->row_size);
-                            cur->rowid_lookup_eof = false;
-                        }
-                    } else if (!def->lookup_fn && has_cache_builder(def)) {
-                        rowbuf rows;
-                        memset(&rows, 0, sizeof(rows));
-                        rows.row_size = def->row_size;
-                        struct xsql_rowset rs = {&rows};
-                        CachedVtab *vtab =
-                            (CachedVtab *)pCursor->pVtab;
-                        invoke_cache_builder(def, vtab, &rs);
-                        if (xsqlc_vtab_has_error()) {
-                            xsqlc_rowbuf_free(&rows);
-                            return xsqlc_vtab_return_error(pCursor->pVtab);
-                        }
-                        size_t rid = (size_t)raw;
-                        if (rid < rows.count) {
-                            memcpy(cur->rowid_lookup_row,
-                                   xsqlc_rowbuf_at(&rows, rid), def->row_size);
-                            cur->rowid_lookup_eof = false;
-                        }
-                        xsqlc_rowbuf_free(&rows);
+                    // The sole authority (see cached_delete / cached_update): a
+                    // key it cannot resolve is no row -- never a cache position
+                    // to retry. Negative keys reach it too.
+                    cur->rowid_lookup_eof =
+                        !def->lookup_fn(cur->rowid_lookup_row, raw,
+                                        def->lookup_user);
+                } else if (def->use_shared_cache) {
+                    if (!xsqlc_cache_ensure_built(def)) {
+                        return xsqlc_vtab_return_error(pCursor->pVtab);
                     }
+                    // Copy under the cache mutex: another connection's
+                    // invalidation swaps the shared rows.
+                    shared_cache *shared = def->shared;
+                    sqlite3_mutex_enter(shared->mutex);
+                    if (shared->built) {
+                        cur->rowid_lookup_eof =
+                            !pick_rowid_row(def, &shared->data, raw,
+                                            cur->rowid_lookup_row);
+                    }
+                    sqlite3_mutex_leave(shared->mutex);
+                } else if (has_cache_builder(def)) {
+                    rowbuf rows;
+                    memset(&rows, 0, sizeof(rows));
+                    rows.row_size = def->row_size;
+                    struct xsql_rowset rs = {&rows};
+                    CachedVtab *vtab = (CachedVtab *)pCursor->pVtab;
+                    invoke_cache_builder(def, vtab, &rs);
+                    if (xsqlc_vtab_has_error()) {
+                        xsqlc_rowbuf_free(&rows);
+                        return xsqlc_vtab_return_error(pCursor->pVtab);
+                    }
+                    cur->rowid_lookup_eof =
+                        !pick_rowid_row(def, &rows, raw, cur->rowid_lookup_row);
+                    xsqlc_rowbuf_free(&rows);
                 }
                 if (xsqlc_vtab_has_error()) {
                     return xsqlc_vtab_return_error(pCursor->pVtab);
                 }
             }
             return SQLITE_OK;
+        }
+
+        // Constraint filter. Tested BEFORE the range arm, whose open-ended
+        // decode would otherwise swallow this idxNum.
+        if (idxNum >= CT_CONSTRAINT_FILTER_BASE) {
+            const cached_constraint_filter *cf = find_constraint_filter(def, idxNum);
+            if (!cf) {
+                xsql_vtab_set_error("unknown constraint filter plan %d on table '%s'",
+                                    idxNum, def->name);
+                return xsqlc_vtab_return_error(pCursor->pVtab);
+            }
+            return run_constraint_filter(cur, cf, idxStr, argc, argv);
         }
 
         // Range (>=, >, <=, <, BETWEEN) plan on an indexed column. CT_RANGE_BASE
@@ -792,15 +1184,52 @@ static int cached_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
             int range_flags = encoded & CT_RANGE_FLAG_MASK;
             if (index_pos >= 0 && (size_t)index_pos < def->nindexes) {
                 // Decode bounds from argv: low first (if present), then high.
+                // The plan is omit=1, so each bound is normalized to the integer
+                // bound with the same meaning over integer keys (see
+                // normalize_bound); one no key can satisfy empties the window.
                 int arg = 0;
                 int64_t low = 0, high = 0;
-                if (range_flags & XSQLC_RANGE_HAS_LOW) {
-                    if (arg < argc) low = sqlite3_value_int64(argv[arg]);
-                    ++arg;
+                bool empty = false;
+                for (int side = 0; side < 2; ++side) {
+                    const int has = side == 0 ? XSQLC_RANGE_HAS_LOW : XSQLC_RANGE_HAS_HIGH;
+                    const int strict_bit =
+                        side == 0 ? XSQLC_RANGE_LOW_STRICT : XSQLC_RANGE_HIGH_STRICT;
+                    if (!(range_flags & has)) {
+                        continue;
+                    }
+                    if (arg >= argc) {
+                        break;
+                    }
+                    bool strict = (range_flags & strict_bit) != 0;
+                    int64_t b = 0;
+                    switch (normalize_bound(argv[arg++], side == 0, &strict, &b)) {
+                        case BOUND_OOM:
+                            xsql_vtab_set_error("out of memory");
+                            return xsqlc_vtab_return_error(pCursor->pVtab);
+                        case XSQLC_BOUND_EMPTY:
+                            empty = true;
+                            break;
+                        case XSQLC_BOUND_NONE:
+                            range_flags &= ~(has | strict_bit);
+                            break;
+                        default:
+                            range_flags = strict ? (range_flags | strict_bit)
+                                                 : (range_flags & ~strict_bit);
+                            if (side == 0) {
+                                low = b;
+                            } else {
+                                high = b;
+                            }
+                            break;
+                    }
                 }
-                if (range_flags & XSQLC_RANGE_HAS_HIGH) {
-                    if (arg < argc) high = sqlite3_value_int64(argv[arg]);
-                    ++arg;
+                if (empty) {
+                    xsqlc_poslist_clear(&cur->range_matches);
+                    cur->using_index = true;
+                    cur->index_matches = &cur->range_matches;
+                    cur->index_data_source = NULL;
+                    cur->index_pos = 0;
+                    return SQLITE_OK;
                 }
                 xsqlc_vtab_clear_error();
                 if (def->use_shared_cache) {
@@ -905,6 +1334,21 @@ static int cached_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
         if (idxNum >= CT_INDEX_BASE) {
             int index_pos = idxNum - CT_INDEX_BASE;
             if (index_pos >= 0 && (size_t)index_pos < def->nindexes) {
+                int64_t key = 0;
+                bool oom = false;
+                if (!eq_lookup_key(argv[0], &key, &oom)) {
+                    if (oom) {
+                        xsql_vtab_set_error("out of memory");
+                        return xsqlc_vtab_return_error(pCursor->pVtab);
+                    }
+                    // No integer key equals this value: an empty result.
+                    xsqlc_poslist_clear(&cur->range_matches);
+                    cur->using_index = true;
+                    cur->index_matches = &cur->range_matches;
+                    cur->index_data_source = NULL;
+                    cur->index_pos = 0;
+                    return SQLITE_OK;
+                }
                 xsqlc_vtab_clear_error();
                 if (def->use_shared_cache) {
                     if (!xsqlc_cache_ensure_built(def)) {
@@ -912,7 +1356,6 @@ static int cached_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
                     }
                     shared_cache *shared = def->shared;
                     if (shared->built && (size_t)index_pos < shared->nindexes) {
-                        int64_t key = sqlite3_value_int64(argv[0]);
                         // Copy the matched rows into cursor-owned storage under the
                         // cache mutex, so a concurrent invalidate can't free the
                         // shared index/data out from under the cursor mid-scan.
@@ -951,7 +1394,6 @@ static int cached_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
                         return xsqlc_vtab_return_error(pCursor->pVtab);
                     }
                     if ((size_t)index_pos < cur->n_cursor_indexes) {
-                        int64_t key = sqlite3_value_int64(argv[0]);
                         cur->using_index = true;
                         cur->index_matches =
                             xsqlc_i64map_get(&cur->cursor_indexes[index_pos], key);
@@ -973,11 +1415,22 @@ static int cached_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
             cur->iterator_eof = true;
             xsql_row_iter it;
             memset(&it, 0, sizeof(it));
-            if (f->factory((xsql_value *)argv[0], &it, f->user)) {
+            // omit=1 equality: a value the factory's key cannot equal yields no
+            // rows and no call (see xsqlc_eq_filter_arg).
+            sqlite3_value *copy = NULL;
+            const xsqlc_eq_arg how = xsqlc_eq_filter_arg(
+                argv[0], (xsqlc_key_kind)f->key_kind, &copy);
+            if (how == XSQLC_EQ_ARG_OOM) {
+                xsql_vtab_set_error("out of memory");
+                return xsqlc_vtab_return_error(pCursor->pVtab);
+            }
+            if (how != XSQLC_EQ_ARG_NONE &&
+                f->factory((xsql_value *)(copy ? copy : argv[0]), &it, f->user)) {
                 cur->iter = it;
                 cur->has_iter = true;
                 cur->iterator_eof = !cur->iter.next(cur->iter.self);
             }
+            sqlite3_value_free(copy);
             if (xsqlc_vtab_has_error()) {
                 return xsqlc_vtab_return_error(pCursor->pVtab);
             }
@@ -992,24 +1445,35 @@ static int cached_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
             return xsqlc_vtab_return_error(pCursor->pVtab);
         }
     } else if (def->projection_fn || has_cache_builder(def)) {
-        xsqlc_rowbuf_clear(&cur->cache);
-        xsqlc_vtab_clear_error();
-        struct xsql_rowset rs = {&cur->cache};
-        if (def->projection_fn) {
-            uint64_t col_used = ~(uint64_t)0;
-            if (idxStr && *idxStr) {
-                col_used = (uint64_t)strtoull(idxStr, NULL, 10);
-            }
-            def->projection_fn(&rs, col_used, def->projection_user);
-        } else {
-            CachedVtab *vtab = (CachedVtab *)pCursor->pVtab;
-            invoke_cache_builder(def, vtab, &rs);
+        uint64_t col_used = ~(uint64_t)0;
+        if (def->projection_fn && idxStr && *idxStr) {
+            col_used = (uint64_t)strtoull(idxStr, NULL, 10);
         }
-        if (xsqlc_vtab_has_error()) {
+        const uint64_t generation = xsqlc_cache_write_generation(def);
+        // Reuse this cursor's rows when nothing could have changed them: same
+        // projection, no write through the table since the build. Without this
+        // a nested-loop JOIN rebuilt the whole table once per OUTER row.
+        const bool reuse = cur->cache_built && cur->cache_col_used == col_used &&
+                           cur->cache_generation == generation;
+        if (!reuse) {
             xsqlc_rowbuf_clear(&cur->cache);
-            return xsqlc_vtab_return_error(pCursor->pVtab);
+            cur->cache_built = false;
+            xsqlc_vtab_clear_error();
+            struct xsql_rowset rs = {&cur->cache};
+            if (def->projection_fn) {
+                def->projection_fn(&rs, col_used, def->projection_user);
+            } else {
+                CachedVtab *vtab = (CachedVtab *)pCursor->pVtab;
+                invoke_cache_builder(def, vtab, &rs);
+            }
+            if (xsqlc_vtab_has_error()) {
+                xsqlc_rowbuf_clear(&cur->cache);
+                return xsqlc_vtab_return_error(pCursor->pVtab);
+            }
+            cur->cache_built = true;
+            cur->cache_col_used = col_used;
+            cur->cache_generation = generation;
         }
-        cur->cache_built = true;
     }
     cur->using_iterator = false;
     cur->using_index = false;
@@ -1017,20 +1481,16 @@ static int cached_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
     return SQLITE_OK;
 }
 
-// A LIKE/GLOB constraint is worth a prefix filter only if the pattern has a
-// usable literal prefix; unknown-at-plan (bound param) => claim (A9).
-static bool like_has_usable_prefix(sqlite3_index_info *info, int i) {
-    sqlite3_value *rhs = NULL;
-    int rc = sqlite3_vtab_rhs_value(info, i, &rhs);
-    if (rc != SQLITE_OK || !rhs) {
-        return true;
+// The first usable constraint on `column_index` with SQLite operator `op_code`.
+static int find_usable_constraint(const sqlite3_index_info *info,
+                                  int column_index, int op_code) {
+    for (int i = 0; i < info->nConstraint; ++i) {
+        const struct sqlite3_index_constraint *c = &info->aConstraint[i];
+        if (c->usable && xsqlc_binary_constraint(info, i) && c->iColumn == column_index && c->op == op_code) {
+            return i;
+        }
     }
-    const unsigned char *text = sqlite3_value_text(rhs);
-    if (!text) {
-        return false;
-    }
-    char c0 = (char)text[0];
-    return c0 != '\0' && c0 != '%' && c0 != '_' && c0 != '\\';
+    return -1;
 }
 
 static int cached_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
@@ -1068,9 +1528,40 @@ static int cached_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
     // tables (engine-lifetime) or query-scoped tables with a cache_builder.
     const bool range_eligible = def->use_shared_cache || has_cache_builder(def);
 
+    // Constraint filters: the cheapest one whose required specs are all present.
+    // Ties go to the one consuming more constraints (each is a predicate SQLite
+    // no longer re-checks). A cache-backed filter needs rows to evaluate, so it
+    // is offered only where a range would be.
+    const cached_constraint_filter *best_cf = NULL;
+    int best_cf_matched = -1;
+    for (size_t f = 0; f < def->nconstr; ++f) {
+        const cached_constraint_filter *cf = &def->constraints[f];
+        if (!cf->factory && !range_eligible) {
+            continue;
+        }
+        int matched = 0;
+        bool required_ok = true;
+        for (size_t s = 0; s < cf->nspecs; ++s) {
+            const cached_constraint_spec *spec = &cf->specs[s];
+            if (find_usable_constraint(info, spec->column_index,
+                                       xsqlc_constraint_sqlite_op(spec->op)) >= 0) {
+                ++matched;
+            } else if (spec->required) {
+                required_ok = false;
+                break;
+            }
+        }
+        if (required_ok && matched > 0 &&
+            (!best_cf || cf->cost < best_cf->cost ||
+             (cf->cost == best_cf->cost && matched > best_cf_matched))) {
+            best_cf = cf;
+            best_cf_matched = matched;
+        }
+    }
+
     for (int i = 0; i < info->nConstraint; ++i) {
         const struct sqlite3_index_constraint *c = &info->aConstraint[i];
-        if (!c->usable) {
+        if (!c->usable || !xsqlc_binary_constraint(info, i)) {
             continue;
         }
         int op = c->op;
@@ -1111,7 +1602,7 @@ static int cached_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
         }
         if (is_like) {
             const cached_filter *f = find_filter(def, c->iColumn, op);
-            if (f && f->cost < best_cost && like_has_usable_prefix(info, i)) {
+            if (f && f->cost < best_cost && xsqlc_like_constraint_has_usable_prefix(info, i)) {
                 best_filter = f;
                 best_filter_constraint = i;
                 best_cost = f->cost;
@@ -1165,6 +1656,42 @@ static int cached_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
         info->idxNum = CT_ROWID_FILTER;
         info->estimatedCost = 1.0;
         info->estimatedRows = 1;
+    } else if (best_cf && best_cf->cost < best_cost) {
+        // Encode which spec each argv slot belongs to, in argv order, so xFilter
+        // can rebuild the (column, op, value) triples. omit=1: SQLite does not
+        // re-check these, which is why xFilter fails hard on a bad position.
+        xsqlc_strbuf sb;
+        xsqlc_sb_init(&sb);
+        int argv_slot = 0;
+        for (size_t s = 0; s < best_cf->nspecs; ++s) {
+            const cached_constraint_spec *spec = &best_cf->specs[s];
+            int ci = find_usable_constraint(info, spec->column_index,
+                                            xsqlc_constraint_sqlite_op(spec->op));
+            if (ci < 0) {
+                continue;
+            }
+            info->aConstraintUsage[ci].argvIndex = ++argv_slot;
+            info->aConstraintUsage[ci].omit = 1;
+            if (argv_slot > 1) {
+                xsqlc_sb_putc(&sb, ',');
+            }
+            xsqlc_sb_append_size(&sb, s);
+        }
+        char *idx = xsqlc_sb_oom(&sb) ? NULL : sqlite3_mprintf("%s", xsqlc_sb_cstr(&sb));
+        xsqlc_sb_free(&sb);
+        if (!idx) {
+            return SQLITE_NOMEM;
+        }
+        // This plan's idxStr is its spec list: drop a projection colUsed string
+        // set above (a constraint plan does not use it).
+        if (info->needToFreeIdxStr && info->idxStr) {
+            sqlite3_free(info->idxStr);
+        }
+        info->idxStr = idx;
+        info->needToFreeIdxStr = 1;
+        info->idxNum = best_cf->filter_id;
+        info->estimatedCost = best_cf->cost;
+        info->estimatedRows = (sqlite3_int64)best_cf->est_rows;
     } else if (best_index_pos >= 0 && best_index_constraint >= 0 &&
                !best_filter) {
         info->aConstraintUsage[best_index_constraint].argvIndex = 1;
@@ -1253,15 +1780,26 @@ static int cached_delete(CachedVtab *vtab, sqlite3_value **argv) {
         return xsqlc_vtab_return_error(&vtab->base);
     }
 
-    if (rbr && !def->rowid_fn && def->use_shared_cache && shared->built &&
-        raw >= 0 && rowid < shared->data.count) {
+    // Positional lookups (shared->data[rowid], the snapshot, a rebuild) are valid
+    // ONLY when the rowid is a cache position: no rowid_fn -- hence no lookup_fn,
+    // which requires one (cached_identity_ok) and resolves every rowid itself.
+    xsqlc_vtab_clear_error();
+    if (def->lookup_fn) {
+        // The sole authority for a table that has one: every rowid its scans
+        // report is a key, so an unresolvable rowid is a row that is gone --
+        // never a cache position to retry.
+        if (!cached_row_lookup_or_error(def, raw, temp)) {
+            xsqlc_free(temp);
+            return xsqlc_vtab_return_error(&vtab->base);
+        }
+        row_ptr = temp;
+    } else if (rbr && !def->rowid_fn && def->use_shared_cache && shared->built &&
+               raw >= 0 && rowid < shared->data.count) {
         row_ptr = xsqlc_rowbuf_at(&shared->data, rowid);
     } else if (rbr && !def->rowid_fn && def->use_shared_cache &&
-               shared->mutation_snapshot && !def->lookup_fn && raw >= 0 &&
+               shared->mutation_snapshot && raw >= 0 &&
                rowid < shared->data.count) {
         row_ptr = xsqlc_rowbuf_at(&shared->data, rowid);
-    } else if (def->lookup_fn && def->lookup_fn(temp, raw, def->lookup_user)) {
-        row_ptr = temp;
     } else if (!def->use_shared_cache && vtab->mutation_snapshot_valid &&
                raw >= 0 && rowid < vtab->mutation_snapshot.count) {
         // Query-scoped snapshot: stable pre-mutation row for a multi-row DELETE.
@@ -1271,7 +1809,7 @@ static int cached_delete(CachedVtab *vtab, sqlite3_value **argv) {
         // query_scoped_uses_mutation_snapshot() (no lookup_fn / rowid_fn /
         // filters). INSTEAD-OF/trigger writes that supply an out-of-band rowid do
         // NOT reconstruct here — they fall through to the builder branch below or
-        // to SQLITE_ERROR — so a foreign rowid can never index the snapshot.
+        // to the not-found error — so a foreign rowid can never index the snapshot.
         row_ptr = xsqlc_rowbuf_at(&vtab->mutation_snapshot, rowid);
     } else if (!def->rowid_fn && !def->use_shared_cache && has_cache_builder(def) &&
                raw >= 0) {
@@ -1299,7 +1837,7 @@ static int cached_delete(CachedVtab *vtab, sqlite3_value **argv) {
 
     if (!row_ptr) {
         xsqlc_free(temp);
-        return SQLITE_ERROR;
+        return cached_row_not_found(vtab, raw);
     }
     xsqlc_transaction_touch(&vtab->transaction);
     fire_modify(def->before_modify_fn, def->before_user, "DELETE FROM ",
@@ -1314,6 +1852,10 @@ static int cached_delete(CachedVtab *vtab, sqlite3_value **argv) {
     }
     if (def->use_shared_cache) {
         xsqlc_cache_invalidate_after_mutation(def);
+    } else {
+        // Query-scoped: no shared data to drop, but cursor-lived caches of
+        // this table must not be reused across this write.
+        xsqlc_cache_bump_write_generation(def);
     }
     fire_modify(def->after_modify_fn, def->after_user, "DELETE FROM ", def->name);
     return SQLITE_OK;
@@ -1368,16 +1910,34 @@ static int cached_update(CachedVtab *vtab, int argc, sqlite3_value **argv) {
     void *row_ptr = NULL;
     bool rbr = reconstruct_by_rowid(def);
 
-    if (rbr && !def->rowid_fn && def->use_shared_cache && shared->built &&
-        raw >= 0 && old_rowid < shared->data.count) {
+    // When rbr, unchanged identity columns arrive as NOCHANGE/0/NULL, so a
+    // lookup_fn miss must NOT fall back to the populator (it would write the
+    // wrong row).
+    xsqlc_vtab_clear_error();
+    if (def->lookup_fn) {
+        if (!rbr && def->populator_fn) {
+            // Opted out (update_from_column_values): NOCHANGE is off, so every
+            // column carries its real value and the table reconstructs the row
+            // from them. The rowid is not interpreted at all.
+            def->populator_fn(temp, argc, (xsql_value **)argv,
+                              def->populator_user);
+            row_ptr = temp;
+        } else if (cached_row_lookup_or_error(def, raw, temp)) {
+            // The sole authority (see cached_delete): every rowid the scans
+            // report is a key, so one it cannot resolve is a row that is gone --
+            // never a cache position, never argv under NOCHANGE.
+            row_ptr = temp;
+        } else {
+            xsqlc_free(temp);
+            return xsqlc_vtab_return_error(&vtab->base);
+        }
+    } else if (rbr && !def->rowid_fn && def->use_shared_cache && shared->built &&
+               raw >= 0 && old_rowid < shared->data.count) {
         row_ptr = xsqlc_rowbuf_at(&shared->data, old_rowid);
     } else if (rbr && !def->rowid_fn && def->use_shared_cache &&
-               shared->mutation_snapshot && !def->lookup_fn && raw >= 0 &&
+               shared->mutation_snapshot && raw >= 0 &&
                old_rowid < shared->data.count) {
         row_ptr = xsqlc_rowbuf_at(&shared->data, old_rowid);
-    } else if (rbr && def->lookup_fn &&
-               def->lookup_fn(temp, raw, def->lookup_user)) {
-        row_ptr = temp;
     } else if (!rbr && def->populator_fn) {
         // NOCHANGE off: unchanged identity columns carry real values in argv.
         def->populator_fn(temp, argc, (xsql_value **)argv, def->populator_user);
@@ -1413,13 +1973,20 @@ static int cached_update(CachedVtab *vtab, int argc, sqlite3_value **argv) {
         }
         xsqlc_rowbuf_free(&rows);
     } else if (def->populator_fn) {
+        // Last resort, never reached by a lookup_fn table. CONTRACT: when this
+        // runs under NOCHANGE (a positional shared-cache table whose cache is not
+        // built yet, reached via filter_eq) the populator must resolve the row
+        // from the rowid in argv[0] and apply only non-NOCHANGE values.
         def->populator_fn(temp, argc, (xsql_value **)argv, def->populator_user);
-        row_ptr = temp;
-    } else if (def->lookup_fn && def->lookup_fn(temp, raw, def->lookup_user)) {
         row_ptr = temp;
     } else {
         xsqlc_free(temp);
         return SQLITE_READONLY;
+    }
+    if (!row_ptr) {
+        // A positional rebuild that no longer holds this rowid.
+        xsqlc_free(temp);
+        return cached_row_not_found(vtab, raw);
     }
 
     // reconstruct_by_rowid gates the read-only-write rejection: on argv-reconstruct
@@ -1434,6 +2001,10 @@ static int cached_update(CachedVtab *vtab, int argc, sqlite3_value **argv) {
     xsqlc_free(temp);
     if (def->use_shared_cache) {
         xsqlc_cache_invalidate_after_mutation(def);
+    } else {
+        // Query-scoped: no shared data to drop, but cursor-lived caches of
+        // this table must not be reused across this write.
+        xsqlc_cache_bump_write_generation(def);
     }
     fire_modify(def->after_modify_fn, def->after_user, "UPDATE ", def->name);
     return SQLITE_OK;
@@ -1473,6 +2044,7 @@ static int cached_update_dispatch(sqlite3_vtab *pVtab, int argc,
     }
     if (rc == SQLITE_OK) {
         xsqlc_transaction_write(&vtab->transaction);
+        xsqlc_note_vtab_write(vtab->owner, vtab->def->counts_as_write);
     }
     return rc;
 }
@@ -1545,6 +2117,7 @@ xsql_cached_table *xsql_cached_table_new(const char *name, size_t row_size) {
     memset(t, 0, sizeof(*t));
     t->row_size = row_size;
     t->use_shared_cache = true;
+    t->counts_as_write = true;
     t->name = xsqlc_strdup(name ? name : "");
     if (!t->name) {
         xsqlc_free(t);
@@ -1569,6 +2142,10 @@ void xsql_cached_table_free(xsql_cached_table *c) {
     xsqlc_free(c->columns);
     xsqlc_free(c->filters);
     xsqlc_free(c->index_defs);
+    for (size_t i = 0; i < c->nconstr; ++i) {
+        xsqlc_free(c->constraints[i].specs);
+    }
+    xsqlc_free(c->constraints);
     xsqlc_shared_cache_free(c->shared);
     xsqlc_free(c->name);
     xsqlc_free(c);
@@ -1629,6 +2206,12 @@ void xsql_cached_after_modify(xsql_cached_table *c, xsql_cached_modify_fn fn,
         c->after_user = user;
     }
 }
+void xsql_cached_counts_as_write(xsql_cached_table *c, bool value) {
+    if (c) {
+        c->counts_as_write = value;
+    }
+}
+
 int xsql_cached_transaction_hooks(
     xsql_cached_table *c, const xsql_transaction_hooks *hooks, void *user) {
     if (!c || (hooks && hooks->struct_size != sizeof(*hooks))) {
@@ -1851,7 +2434,7 @@ int xsql_cached_col_text_rw_value(xsql_cached_table *c, const char *name,
 }
 
 static int add_filter(xsql_cached_table *c, const char *column, double cost,
-                      double est_rows, xsql_filter_op op,
+                      double est_rows, xsql_filter_op op, xsqlc_key_kind key_kind,
                       xsql_filter_factory_fn factory, void *user) {
     if (!c) {
         return XSQL_MISUSE;
@@ -1870,6 +2453,7 @@ static int add_filter(xsql_cached_table *c, const char *column, double cost,
     f->cost = cost;
     f->est_rows = est_rows;
     f->op = op;
+    f->key_kind = (int)key_kind;
     f->factory = factory;
     f->user = user;
     c->nfilters++;
@@ -1879,17 +2463,20 @@ static int add_filter(xsql_cached_table *c, const char *column, double cost,
 int xsql_cached_filter_eq(xsql_cached_table *c, const char *column, double cost,
                           double est_rows, xsql_filter_factory_fn factory,
                           void *user) {
-    return add_filter(c, column, cost, est_rows, XSQL_FILTER_EQ, factory, user);
+    return add_filter(c, column, cost, est_rows, XSQL_FILTER_EQ, XSQLC_KEY_INT,
+                      factory, user);
 }
 int xsql_cached_filter_eq_text(xsql_cached_table *c, const char *column,
                                double cost, double est_rows,
                                xsql_filter_factory_fn factory, void *user) {
-    return add_filter(c, column, cost, est_rows, XSQL_FILTER_EQ, factory, user);
+    return add_filter(c, column, cost, est_rows, XSQL_FILTER_EQ, XSQLC_KEY_TEXT,
+                      factory, user);
 }
 int xsql_cached_filter_prefix(xsql_cached_table *c, const char *column,
                               double cost, double est_rows,
                               xsql_filter_factory_fn factory, void *user) {
-    return add_filter(c, column, cost, est_rows, XSQL_FILTER_LIKE, factory, user);
+    return add_filter(c, column, cost, est_rows, XSQL_FILTER_LIKE, XSQLC_KEY_RAW,
+                      factory, user);
 }
 
 int xsql_cached_index_on(xsql_cached_table *c, const char *column,
@@ -1901,6 +2488,9 @@ int xsql_cached_index_on(xsql_cached_table *c, const char *column,
     if (col < 0) {
         return XSQL_NOT_FOUND;
     }
+    if (c->nindexes >= CT_MAX_INDEXES) {
+        return XSQL_MISUSE;  // idxNum space exhausted (see CT_MAX_INDEXES)
+    }
     if (!xsqlc_vec_reserve((void **)&c->index_defs, &c->index_cap,
                            c->nindexes + 1, sizeof(cached_index_def))) {
         return XSQL_NO_MEMORY;
@@ -1911,6 +2501,76 @@ int xsql_cached_index_on(xsql_cached_table *c, const char *column,
     ix->user = user;
     c->nindexes++;
     return XSQL_OK;
+}
+
+// Shared by both constraint-filter registrars. `factory` NULL => cache-backed,
+// which additionally needs an index per column and rejects LIKE. Unlike the
+// single-column registrars, which degrade to "no pushdown, still correct",
+// every misconfiguration here is an error: a silently missing containment
+// filter would only ever show up as an unexplained full scan.
+static int add_constraint_filter(xsql_cached_table *c,
+                                 const xsql_constraint_req *reqs, size_t nreqs,
+                                 double cost, double est_rows,
+                                 xsql_cached_constraint_fn factory, void *user) {
+    if (!c || !reqs || nreqs == 0) {
+        return XSQL_MISUSE;
+    }
+    size_t bytes = 0;
+    if (!xsqlc_mul_ok(nreqs, sizeof(cached_constraint_spec), &bytes)) {
+        return XSQL_NO_MEMORY;
+    }
+    cached_constraint_spec *specs = (cached_constraint_spec *)xsqlc_malloc(bytes);
+    if (!specs) {
+        return XSQL_NO_MEMORY;
+    }
+    for (size_t s = 0; s < nreqs; ++s) {
+        int col = find_column(c, reqs[s].column);
+        if (col < 0) {
+            xsqlc_free(specs);
+            return XSQL_NOT_FOUND;
+        }
+        if (!factory &&
+            (find_index(c, col) < 0 || reqs[s].op == XSQL_CONSTRAINT_LIKE)) {
+            xsqlc_free(specs);
+            return XSQL_MISUSE;
+        }
+        specs[s].column_index = col;
+        specs[s].op = reqs[s].op;
+        specs[s].required = reqs[s].required;
+    }
+    if (!xsqlc_vec_reserve((void **)&c->constraints, &c->constr_cap,
+                           c->nconstr + 1, sizeof(cached_constraint_filter))) {
+        xsqlc_free(specs);
+        return XSQL_NO_MEMORY;
+    }
+    cached_constraint_filter *cf = &c->constraints[c->nconstr];
+    memset(cf, 0, sizeof(*cf));
+    cf->specs = specs;
+    cf->nspecs = nreqs;
+    cf->filter_id = CT_CONSTRAINT_FILTER_BASE + (int)c->nconstr;
+    cf->cost = cost;
+    cf->est_rows = est_rows;
+    cf->factory = factory;
+    cf->user = user;
+    c->nconstr++;
+    return XSQL_OK;
+}
+
+int xsql_cached_constraint_filter(xsql_cached_table *c,
+                                  const xsql_constraint_req *reqs, size_t nreqs,
+                                  double cost, double est_rows,
+                                  xsql_cached_constraint_fn factory, void *user) {
+    if (!factory) {
+        return XSQL_MISUSE;
+    }
+    return add_constraint_filter(c, reqs, nreqs, cost, est_rows, factory, user);
+}
+
+int xsql_cached_constraint_cache_filter(xsql_cached_table *c,
+                                        const xsql_constraint_req *reqs,
+                                        size_t nreqs, double cost,
+                                        double est_rows) {
+    return add_constraint_filter(c, reqs, nreqs, cost, est_rows, NULL, NULL);
 }
 
 void xsql_cached_rowid(xsql_cached_table *c, xsql_cached_rowid_fn fn, void *user) {
@@ -1959,11 +2619,56 @@ void xsql_cached_insertable(xsql_cached_table *c, xsql_cached_insert_fn fn,
 // Registration
 // ---------------------------------------------------------------------------
 
+// Module destructor: SQLite drops the module (re-registration under the same
+// name, or xsql_close). Unhook the binding from its connection, then free it.
+// The def itself is caller-owned and untouched.
+static void cached_module_destroy(void *p) {
+    xsqlc_cached_binding *binding = (xsqlc_cached_binding *)p;
+    if (!binding) {
+        return;
+    }
+    xsqlc_db_remove_cached_binding(binding->owner, binding);
+    xsqlc_free(binding);
+}
+
+// Create the module named `module_name` for `c` on `db`, recorded for
+// xsql_db_invalidate_cached_tables(). On failure SQLite has already run the
+// destructor, so nothing is left behind.
+static int create_cached_module(struct xsql_db *db, xsql_cached_table *c,
+                                const char *module_name) {
+    // Row identity (see cached_identity_ok): refuse, loudly, a definition whose
+    // scans would report cache positions that its lookup_fn reads as keys.
+    if (!cached_identity_ok(c)) {
+        char *msg = sqlite3_mprintf(
+            "cached table '%s': xsql_cached_row_lookup() requires "
+            "xsql_cached_rowid(): scans must report the same key the row "
+            "lookup resolves, not a cache position",
+            c->name);
+        xsqlc_str_set(&db->last_error, msg ? msg : "out of memory");
+        sqlite3_free(msg);
+        return XSQL_MISUSE;
+    }
+    xsqlc_cached_binding *binding =
+        (xsqlc_cached_binding *)xsqlc_malloc(sizeof(*binding));
+    if (!binding) {
+        return XSQL_NO_MEMORY;
+    }
+    binding->def = c;
+    binding->owner = db;
+    const int rc = xsqlc_db_add_cached_binding(db, binding);
+    if (rc != XSQL_OK) {
+        xsqlc_free(binding);
+        return rc;
+    }
+    return sqlite3_create_module_v2(db->db, module_name, &g_cached_module,
+                                    binding, cached_module_destroy);
+}
+
 int xsql_cached_table_register_module(struct xsql_db *db, xsql_cached_table *c) {
     if (!db || !db->db || !c || !xsqlc_is_valid_sql_identifier(c->name)) {
         return XSQL_MISUSE;
     }
-    return sqlite3_create_module_v2(db->db, c->name, &g_cached_module, c, NULL);
+    return create_cached_module(db, c, c->name);
 }
 
 int xsql_cached_table_register_as(struct xsql_db *db, xsql_cached_table *c,
@@ -1971,8 +2676,7 @@ int xsql_cached_table_register_as(struct xsql_db *db, xsql_cached_table *c,
     if (!db || !db->db || !c || !xsqlc_is_valid_sql_identifier(table_name)) {
         return XSQL_MISUSE;
     }
-    int rc = sqlite3_create_module_v2(db->db, table_name, &g_cached_module, c,
-                                      NULL);
+    int rc = create_cached_module(db, c, table_name);
     if (rc != SQLITE_OK) {
         return rc;
     }
@@ -1985,4 +2689,43 @@ int xsql_cached_table_register(struct xsql_db *db, xsql_cached_table *c) {
         return XSQL_MISUSE;
     }
     return xsql_cached_table_register_as(db, c, c->name);
+}
+
+// ---------------------------------------------------------------------------
+// Invalidation
+// ---------------------------------------------------------------------------
+
+void xsql_cached_invalidate(xsql_cached_table *c) {
+    if (c) {
+        xsqlc_cache_invalidate_after_mutation(c);
+    }
+}
+
+void xsql_db_invalidate_cached_tables(struct xsql_db *db) {
+    if (!db || !db->db) {
+        return;
+    }
+    // Same connection mutex that registration and every scan run under
+    // (recursive, so a scalar callback mid-statement re-enters it). Each
+    // invalidation only takes its table's cache mutex, and cannot register or
+    // drop a module, so the array is stable for the walk.
+    sqlite3_mutex *mutex = sqlite3_db_mutex(db->db);
+    sqlite3_mutex_enter(mutex);
+    for (size_t i = 0; i < db->cached_binding_count; ++i) {
+        xsqlc_cache_invalidate_after_mutation(db->cached_bindings[i]->def);
+    }
+    sqlite3_mutex_leave(mutex);
+}
+
+void xsql_invalidate_cached_tables(struct sqlite3 *db) {
+    if (db) {
+        xsql_db_invalidate_cached_tables(xsqlc_db_from_sqlite(db));
+    }
+}
+
+void xsql_context_invalidate_cached_tables(xsql_context *ctx) {
+    if (ctx) {
+        xsql_invalidate_cached_tables(
+            sqlite3_context_db_handle((sqlite3_context *)ctx));
+    }
 }

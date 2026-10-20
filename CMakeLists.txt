@@ -11,7 +11,7 @@ cmake_minimum_required(VERSION 3.20)
 # Enable CMAKE_MSVC_RUNTIME_LIBRARY support (required for e.g. IDA SDK /MT hosts).
 cmake_policy(SET CMP0091 NEW)
 
-project(libxsqlc VERSION 0.0.2 LANGUAGES C)
+project(libxsqlc VERSION 0.0.3 LANGUAGES C)
 
 # Detect standalone vs. embedded (vendored subdirectory / larger project).
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -21,6 +21,12 @@ else()
 endif()
 
 option(XSQLC_WITH_THINCLIENT "Build thin client support (HTTP server/client)" OFF)
+# gzip response compression (vendored miniz). Defaults ON with the thin client,
+# which is the only thing that uses it; forced OFF without it.
+include(CMakeDependentOption)
+cmake_dependent_option(XSQLC_WITH_GZIP
+    "Compress thin-client HTTP responses with gzip when the client accepts it (vendored miniz)"
+    ON "XSQLC_WITH_THINCLIENT" OFF)
 option(XSQLC_BUILD_EXAMPLES  "Build libxsql-c examples" ${XSQLC_STANDALONE})
 option(XSQLC_SHARED          "Build libxsql-c as a shared library (DLL/.so)" OFF)
 option(XSQLC_TEST_ALLOC_HOOKS "Build private allocator failure hooks for tests" OFF)
@@ -115,7 +121,7 @@ if(XSQLC_SHARED)
         C_VISIBILITY_PRESET hidden
         VISIBILITY_INLINES_HIDDEN ON)
     # C_VISIBILITY_PRESET only governs xsqlc's own objects; the statically-linked
-    # sqlite3/civetweb keep default (public) visibility and would be re-exported.
+    # sqlite3/civetweb/miniz keep default (public) visibility and would be re-exported.
     # On GNU-ld/gold, hide every symbol coming from a static archive so only the
     # XSQL_API surface is exported (Windows already exports only dllexport'd
     # symbols, so it needs no equivalent).
@@ -148,6 +154,7 @@ if(XSQLC_WITH_THINCLIENT)
 
     target_sources(xsqlc PRIVATE
         src/thinclient/http_server.c
+        src/thinclient/stream_coalescer.c
         src/thinclient/client.c
         src/thinclient/cli.c
         src/thinclient/json_parse.c
@@ -166,6 +173,18 @@ if(XSQLC_WITH_THINCLIENT)
     endif()
 
     target_compile_definitions(xsqlc PUBLIC XSQL_HAS_THINCLIENT)
+
+    # gzip responses: raw deflate from the vendored miniz (MIT), with the gzip
+    # framing in src/thinclient/gzip.c. PRIVATE like civetweb; the define is
+    # private too, because no public API changes with it.
+    if(XSQLC_WITH_GZIP)
+        if(NOT TARGET xsqlc_miniz)
+            add_subdirectory(external/miniz)
+        endif()
+        target_sources(xsqlc PRIVATE src/thinclient/gzip.c)
+        target_link_libraries(xsqlc PRIVATE xsqlc_miniz)
+        target_compile_definitions(xsqlc PRIVATE XSQLC_HAS_GZIP)
+    endif()
 endif()
 
 # ============================================================================
@@ -201,6 +220,10 @@ if(XSQLC_STANDALONE)
             if(NOT _xsqlc_civetweb_alias)
                 list(APPEND XSQLC_INSTALL_TARGETS civetweb)
             endif()
+        endif()
+        # xsqlc_miniz exists only when gzip was enabled.
+        if(TARGET xsqlc_miniz)
+            list(APPEND XSQLC_INSTALL_TARGETS xsqlc_miniz)
         endif()
     endif()
 

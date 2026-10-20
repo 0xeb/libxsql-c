@@ -5,8 +5,9 @@
 // See LICENSE.
 
 // table_generator.c — the generator virtual-table module: the sqlite3_module
-// trampolines for a STREAMING (never-materialized) source, xBestIndex (constraint
-// / parametric / single-column / missing-required / full-scan priority), xFilter
+// trampolines for a STREAMING (never-materialized) source, xBestIndex (the
+// cheapest of the constraint / parametric / single-column filters, then
+// missing-required, then full scan), xFilter
 // (build the generator or iterator and prime it once), xColumn (the A8
 // unconditional NOCHANGE early-return), xRowid, and the row_lookup-based
 // UPDATE/DELETE/INSERT path, plus the builder + registrars. Shared vtab helpers
@@ -91,18 +92,6 @@ static int find_column(const xsql_generator_table *t, const char *name) {
     return -1;
 }
 
-static int sqlite_constraint_op(xsql_constraint_op op) {
-    switch (op) {
-        case XSQL_CONSTRAINT_GT:   return SQLITE_INDEX_CONSTRAINT_GT;
-        case XSQL_CONSTRAINT_LE:   return SQLITE_INDEX_CONSTRAINT_LE;
-        case XSQL_CONSTRAINT_LT:   return SQLITE_INDEX_CONSTRAINT_LT;
-        case XSQL_CONSTRAINT_GE:   return SQLITE_INDEX_CONSTRAINT_GE;
-        case XSQL_CONSTRAINT_LIKE: return SQLITE_INDEX_CONSTRAINT_LIKE;
-        case XSQL_CONSTRAINT_EQ:
-        default:                   return SQLITE_INDEX_CONSTRAINT_EQ;
-    }
-}
-
 static void column_emit(const gen_column *c, xsql_context *ctx, const void *row) {
     switch (c->get_kind) {
         case GGET_I64:    xsql_result_i64(ctx, c->get.i64(row, c->user)); break;
@@ -116,8 +105,16 @@ static void column_emit(const gen_column *c, xsql_context *ctx, const void *row)
 
 static bool column_set(const gen_column *c, void *row, xsql_value *val) {
     switch (c->set_kind) {
-        case GSET_I64: return c->set.i64(row, xsql_value_i64(val), c->user);
-        case GSET_INT: return c->set.i(row, xsql_value_int(val), c->user);
+        case GSET_I64: {
+            int64_t v = 0;
+            return xsqlc_exact_setter_int64((sqlite3_value *)val, c->name, &v) &&
+                   c->set.i64(row, v, c->user);
+        }
+        case GSET_INT: {
+            int v = 0;
+            return xsqlc_exact_setter_int((sqlite3_value *)val, c->name, &v) &&
+                   c->set.i(row, v, c->user);
+        }
         case GSET_TEXT: {
             const char *tx = xsql_value_text(val);
             return c->set.text(row, tx ? tx : "", c->user);
@@ -376,6 +373,16 @@ static int materialize_count_only_generator(GeneratorCursor *cur,
     }
 
     const xsql_generator_table *def = cur->def;
+    // SQLite plans COUNT(*) and a rowid-only scan alike (colUsed == 0). Turning
+    // the count-only cursor into a real generator IS a full scan, so a table
+    // that forbids one refuses here exactly as xFilter's full-scan branch does;
+    // only the count itself, which enumerates nothing, is exempt.
+    if (def->full_scan_error) {
+        cur->count_only = false;
+        cur->gen_eof = true;
+        xsql_vtab_set_error("%s", def->full_scan_error);
+        return xsqlc_vtab_return_refusal(cur->base.pVtab);
+    }
     xsqlc_vtab_clear_error();
     xsql_generator gen;
     memset(&gen, 0, sizeof(gen));
@@ -483,7 +490,7 @@ static int find_usable_constraint(sqlite3_index_info *info, int column_index,
                                   int op_code) {
     for (int i = 0; i < info->nConstraint; ++i) {
         const struct sqlite3_index_constraint *c = &info->aConstraint[i];
-        if (c->usable && c->iColumn == column_index && c->op == op_code) {
+        if (c->usable && xsqlc_binary_constraint(info, i) && c->iColumn == column_index && c->op == op_code) {
             return i;
         }
     }
@@ -512,7 +519,7 @@ static void probe_constraint_filter(const gen_constraint_filter *cf,
     for (size_t s = 0; s < cf->nspecs; ++s) {
         const gen_constraint_spec *spec = &cf->specs[s];
         int ci = find_usable_constraint(info, spec->column_index,
-                                        sqlite_constraint_op(spec->op));
+                                        xsqlc_constraint_sqlite_op(spec->op));
         if (ci >= 0) {
             matched++;
         } else if (spec->required) {
@@ -527,11 +534,12 @@ static void probe_constraint_filter(const gen_constraint_filter *cf,
     *required_ok = req_ok;
 }
 
-// colUsed carriage, shared by the three projection-aware plans (full scan,
-// filter_eq, parametric). SQLite gives xFilter no colUsed of its own, so
-// xBestIndex stashes it as a decimal string in idxStr and xFilter decodes it.
-// Safe on all three because none of those plans uses idxStr for anything else —
-// only the constraint-filter plan does, and it has no projection variant.
+// colUsed carriage for the plans that use idxStr for nothing else (full scan,
+// the single-column filters, parametric). SQLite gives xFilter no colUsed of its
+// own, so xBestIndex stashes it as a decimal string in idxStr and xFilter decodes
+// it. The constraint-filter plan's idxStr is its spec list, so its projection
+// variant carries colUsed as a "<colUsed>;" prefix instead (see generator_
+// best_index); this helper cannot serve it.
 static bool gen_set_col_used_idxstr(sqlite3_index_info *info) {
     char *s = sqlite3_mprintf("%llu", (unsigned long long)info->colUsed);
     if (!s) {
@@ -568,8 +576,15 @@ static int generator_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
         return SQLITE_OK;
     }
 
-    // 1. Constraint filters — pick the best fully-satisfied one (lower cost, then
-    //    order-consumption, then more matched specs).
+    // Every filter kind competes by estimated cost: the cheapest matching
+    // constraint filter, the cheapest parametric filter and the cheapest
+    // single-column filter. The cheapest plan wins; on a cost tie the
+    // single-column filter wins (the rule the cached planner applies to its
+    // constraint filters), then the constraint filter, then the parametric one.
+    // (C++ generator_vtab_best_index.)
+
+    // Constraint filters: the best fully-satisfied one (lower cost, then
+    // order-consumption, then more matched specs).
     const gen_constraint_filter *best_cf = NULL;
     bool                         best_cf_consumes = false;
     int                          best_cf_matched = 0;
@@ -600,16 +615,79 @@ static int generator_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
             best_cf_matched = matched;
         }
     }
-    if (best_cf) {
+
+    // Parametric filters: match only when EVERY column has a usable EQ; the
+    // cheapest matching one (the first registered on a tie) is the candidate.
+    const gen_parametric_filter *best_pf = NULL;
+    for (size_t p = 0; p < def->nparam; ++p) {
+        const gen_parametric_filter *pf = &def->parametric[p];
+        bool all = pf->ncolumns > 0;
+        for (size_t k = 0; k < pf->ncolumns && all; ++k) {
+            if (find_usable_constraint(info, pf->column_indices[k],
+                                       SQLITE_INDEX_CONSTRAINT_EQ) < 0) {
+                all = false;
+            }
+        }
+        if (all && (!best_pf || pf->cost < best_pf->cost)) {
+            best_pf = pf;
+        }
+    }
+
+    // Single-column filters: the cheapest matching one. EQ filters are trusted
+    // (omit=1). A LIKE filter is a best-effort superset (omit=0, so SQLite
+    // re-applies the real pattern), claimed only when the pattern has a usable
+    // literal prefix; otherwise it is left to the full scan.
+    const gen_filter *best_filter = NULL;
+    int               best_filter_ci = -1;
+    double            best_cost = 1e9;
+    for (size_t i = 0; i < def->nfilters; ++i) {
+        const gen_filter *fl = &def->filters[i];
+        const bool is_like = fl->op == XSQL_FILTER_LIKE;
+        int ci = find_usable_constraint(info, fl->column_index,
+                                        is_like ? SQLITE_INDEX_CONSTRAINT_LIKE
+                                                : SQLITE_INDEX_CONSTRAINT_EQ);
+        if (ci < 0 || fl->cost >= best_cost) {
+            continue;
+        }
+        if (is_like && !xsqlc_like_constraint_has_usable_prefix(info, ci)) {
+            continue;
+        }
+        best_filter = fl;
+        best_filter_ci = ci;
+        best_cost = fl->cost;
+    }
+
+    // Considered in tie-break order: a later candidate must be strictly cheaper.
+    enum { PICK_NONE, PICK_SINGLE, PICK_CONSTRAINT, PICK_PARAMETRIC } pick = PICK_NONE;
+    double pick_cost = 0.0;
+    if (best_filter && best_filter_ci >= 0) {
+        pick = PICK_SINGLE;
+        pick_cost = best_filter->cost;
+    }
+    if (best_cf && (pick == PICK_NONE || best_cf->cost < pick_cost)) {
+        pick = PICK_CONSTRAINT;
+        pick_cost = best_cf->cost;
+    }
+    if (best_pf && (pick == PICK_NONE || best_pf->cost < pick_cost)) {
+        pick = PICK_PARAMETRIC;
+        pick_cost = best_pf->cost;
+    }
+
+    if (pick == PICK_CONSTRAINT) {
         // Assign argvIndex (1-based, spec order) and build idxStr = matched spec
-        // indices, so xFilter can pair each argv with its column + operator.
+        // indices, so xFilter can pair each argv with its column + operator. A
+        // projection-aware filter prefixes the list with "<colUsed>;"; every
+        // other filter's idxStr is the bare list.
         xsqlc_strbuf sb;
         xsqlc_sb_init(&sb);
+        if (best_cf->factory_projection) {
+            xsqlc_sb_printf(&sb, "%llu;", (unsigned long long)info->colUsed);
+        }
         int argv_idx = 0;
         for (size_t s = 0; s < best_cf->nspecs; ++s) {
             const gen_constraint_spec *spec = &best_cf->specs[s];
             int ci = find_usable_constraint(info, spec->column_index,
-                                            sqlite_constraint_op(spec->op));
+                                            xsqlc_constraint_sqlite_op(spec->op));
             if (ci < 0) {
                 continue;
             }
@@ -640,59 +718,34 @@ static int generator_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
         return SQLITE_OK;
     }
 
-    // 2. Parametric filters — fire only when EVERY column has a usable EQ.
-    for (size_t p = 0; p < def->nparam; ++p) {
-        const gen_parametric_filter *pf = &def->parametric[p];
-        bool all = pf->ncolumns > 0;
-        for (size_t k = 0; k < pf->ncolumns && all; ++k) {
-            if (find_usable_constraint(info, pf->column_indices[k],
-                                       SQLITE_INDEX_CONSTRAINT_EQ) < 0) {
-                all = false;
-            }
-        }
-        if (!all) {
-            continue;
-        }
-        for (size_t k = 0; k < pf->ncolumns; ++k) {
-            int ci = find_usable_constraint(info, pf->column_indices[k],
+    if (pick == PICK_PARAMETRIC) {
+        for (size_t k = 0; k < best_pf->ncolumns; ++k) {
+            int ci = find_usable_constraint(info, best_pf->column_indices[k],
                                             SQLITE_INDEX_CONSTRAINT_EQ);
             info->aConstraintUsage[ci].argvIndex = (int)k + 1;
             info->aConstraintUsage[ci].omit = 1;
         }
-        info->idxNum = pf->filter_id;
-        info->estimatedCost = pf->cost;
-        info->estimatedRows = (sqlite3_int64)pf->est_rows;
+        info->idxNum = best_pf->filter_id;
+        info->estimatedCost = best_pf->cost;
+        info->estimatedRows = (sqlite3_int64)best_pf->est_rows;
         // Projection-aware parametric: carry colUsed through idxStr. This plan
-        // sets no idxStr otherwise, so there is nothing to collide with (the
-        // constraint-filter plan above owns idxStr, and returned already).
-        if (pf->factory_projection && !gen_set_col_used_idxstr(info)) {
+        // sets no idxStr otherwise, so there is nothing to collide with.
+        if (best_pf->factory_projection && !gen_set_col_used_idxstr(info)) {
             return SQLITE_NOMEM;
         }
         return SQLITE_OK;
     }
 
-    // 3. Single-column equality filters — cheapest matching one.
-    const gen_filter *best_filter = NULL;
-    int               best_filter_ci = -1;
-    double            best_cost = 1e9;
-    for (size_t i = 0; i < def->nfilters; ++i) {
-        const gen_filter *fl = &def->filters[i];
-        int ci = find_usable_constraint(info, fl->column_index,
-                                        SQLITE_INDEX_CONSTRAINT_EQ);
-        if (ci >= 0 && fl->cost < best_cost) {
-            best_filter = fl;
-            best_filter_ci = ci;
-            best_cost = fl->cost;
-        }
-    }
-    if (best_filter && best_filter_ci >= 0) {
+    if (pick == PICK_SINGLE) {
         info->aConstraintUsage[best_filter_ci].argvIndex = 1;
-        info->aConstraintUsage[best_filter_ci].omit = 1;
+        info->aConstraintUsage[best_filter_ci].omit =
+            best_filter->op == XSQL_FILTER_EQ ? 1 : 0;
         info->idxNum = best_filter->filter_id;
         info->estimatedCost = best_filter->cost;
         info->estimatedRows = (sqlite3_int64)best_filter->est_rows;
-        // Projection-aware single-column filter: same idxStr carriage as above.
-        if (best_filter->factory_projection && !gen_set_col_used_idxstr(info)) {
+        // Projection-aware and LIKE filters: same idxStr carriage as above.
+        if ((best_filter->factory_projection || best_filter->factory_like) &&
+            !gen_set_col_used_idxstr(info)) {
             return SQLITE_NOMEM;
         }
         return SQLITE_OK;
@@ -700,7 +753,8 @@ static int generator_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
 
     size_t est = def->estimate_fn ? def->estimate_fn(def->estimate_user) : 1000;
 
-    // 4. A required constraint was unmatched with a message: refuse the query.
+    // No filter matched and a required constraint was unmatched with a message:
+    // refuse the query.
     if (missing_required) {
         info->idxNum = GEN_MISSING_REQUIRED_CONSTRAINT;
         info->idxStr = sqlite3_mprintf("%s", missing_required);
@@ -710,13 +764,13 @@ static int generator_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
         return SQLITE_OK;
     }
 
-    // 5. Full scan.
+    // Full scan.
     info->idxNum = GEN_FILTER_NONE;
     info->estimatedCost = (double)est;
     info->estimatedRows = (sqlite3_int64)est;
     // Carry colUsed to xFilter via idxStr (like the cached table) so a projection-aware
     // generator can skip expensive unused columns. Only the GEN_FILTER_NONE plan reaches
-    // xFilter's full-scan branch and uses idxStr (filter/constraint plans returned
+    // xFilter's full-scan branch and uses idxStr (every filter plan returned
     // above), so there is no collision. Only allocated for projection-aware tables.
     if (def->projection_generator_fn && !gen_set_col_used_idxstr(info)) {
         return SQLITE_NOMEM;
@@ -765,6 +819,18 @@ static int generator_run_constraint(GeneratorCursor *cur,
                                     const gen_constraint_filter *cf,
                                     const char *idxStr, int argc,
                                     sqlite3_value **argv) {
+    // A projection-aware filter's idxStr is "<colUsed>;<spec list>" (see
+    // generator_best_index); a plain filter's is the bare list. Absent a prefix,
+    // colUsed means every column.
+    const char *p = idxStr;
+    uint64_t col_used = ~(uint64_t)0;
+    if (cf->factory_projection && p) {
+        const char *sep = strchr(p, ';');
+        if (sep) {
+            col_used = (uint64_t)strtoull(p, NULL, 10);
+            p = sep + 1;
+        }
+    }
     xsql_constraint_arg *args = NULL;
     if (argc > 0) {
         args = (xsql_constraint_arg *)xsqlc_malloc(sizeof(*args) * (size_t)argc);
@@ -772,21 +838,26 @@ static int generator_run_constraint(GeneratorCursor *cur,
             return SQLITE_NOMEM;
         }
         int n = 0;
-        const char *p = idxStr;
         while (p && *p && n < argc) {
             char *end = NULL;
             long v = strtol(p, &end, 10);
             if (end == p) {
                 break;
             }
-            size_t spec = (size_t)(v >= 0 ? v : 0);
-            if (spec < cf->nspecs) {
-                args[n].column_index = cf->specs[spec].column_index;
-                args[n].op = cf->specs[spec].op;
-            } else {
-                args[n].column_index = -1;
-                args[n].op = XSQL_CONSTRAINT_EQ;
+            // A spec index the filter does not have means the plan and the
+            // definition disagree. Skipping it would hand the factory fewer
+            // constraints than SQLite omitted (omit=1), so rows would be wrong:
+            // fail the query instead.
+            if (v < 0 || (unsigned long)v >= cf->nspecs) {
+                xsqlc_free(args);
+                xsql_vtab_set_error(
+                    "internal generator constraint plan mismatch: spec index "
+                    "%ld out of range (%zu specs)",
+                    v, cf->nspecs);
+                return SQLITE_ERROR;
             }
+            args[n].column_index = cf->specs[v].column_index;
+            args[n].op = cf->specs[v].op;
             args[n].value = (xsql_value *)argv[n];
             n++;
             p = (*end == ',') ? end + 1 : end;
@@ -800,7 +871,10 @@ static int generator_run_constraint(GeneratorCursor *cur,
     xsqlc_vtab_clear_error();
     xsql_generator gen;
     memset(&gen, 0, sizeof(gen));
-    bool built = cf->factory(argc, args, &gen, cf->user);
+    bool built =
+        cf->factory_projection
+            ? cf->factory_projection(argc, args, col_used, &gen, cf->user)
+            : cf->factory(argc, args, &gen, cf->user);
     xsqlc_free(args);
     prime_generator(cur, &gen, built);
     return SQLITE_OK;
@@ -824,7 +898,7 @@ static int generator_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
         xsql_vtab_set_error("%s",
                             (idxStr && *idxStr) ? idxStr
                                                 : "required constraint missing");
-        return xsqlc_vtab_return_error(pCursor->pVtab);
+        return xsqlc_vtab_return_refusal(pCursor->pVtab);
     }
 
     if (idxNum >= GEN_CONSTRAINT_FILTER_BASE) {
@@ -871,12 +945,33 @@ static int generator_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
             cur->iterator_eof = true;
             xsql_row_iter it;
             memset(&it, 0, sizeof(it));
-            bool made =
-                fl->factory_projection
-                    ? fl->factory_projection((xsql_value *)argv[0],
-                                             gen_col_used_from_idxstr(idxStr),
-                                             &it, fl->user)
-                    : fl->factory((xsql_value *)argv[0], &it, fl->user);
+            bool made;
+            if (fl->factory_like) {
+                const unsigned char *pattern = sqlite3_value_text(argv[0]);
+                made = fl->factory_like(pattern ? (const char *)pattern : "",
+                                        gen_col_used_from_idxstr(idxStr), &it,
+                                        fl->user);
+            } else {
+                // omit=1 equality: a value the factory's key cannot equal
+                // yields no rows and no call (see xsqlc_eq_filter_arg).
+                sqlite3_value *copy = NULL;
+                const xsqlc_eq_arg how = xsqlc_eq_filter_arg(
+                    argv[0], (xsqlc_key_kind)fl->key_kind, &copy);
+                if (how == XSQLC_EQ_ARG_OOM) {
+                    xsql_vtab_set_error("out of memory");
+                    return xsqlc_vtab_return_error(pCursor->pVtab);
+                }
+                xsql_value *arg = (xsql_value *)(copy ? copy : argv[0]);
+                if (how == XSQLC_EQ_ARG_NONE) {
+                    made = false;
+                } else if (fl->factory_projection) {
+                    made = fl->factory_projection(arg, gen_col_used_from_idxstr(idxStr),
+                                                  &it, fl->user);
+                } else {
+                    made = fl->factory(arg, &it, fl->user);
+                }
+                sqlite3_value_free(copy);
+            }
             if (made) {
                 cur->iter = it;
                 cur->has_iter = true;
@@ -892,7 +987,7 @@ static int generator_xfilter(sqlite3_vtab_cursor *pCursor, int idxNum,
     // Full scan.
     if (def->full_scan_error) {
         xsql_vtab_set_error("%s", def->full_scan_error);
-        return xsqlc_vtab_return_error(pCursor->pVtab);
+        return xsqlc_vtab_return_refusal(pCursor->pVtab);
     }
     if (def->projection_generator_fn) {
         // Projection-aware full scan: decode colUsed (set on the GEN_FILTER_NONE plan).
@@ -1042,6 +1137,7 @@ static int generator_update_dispatch(sqlite3_vtab *pVtab, int argc,
     }
     if (rc == SQLITE_OK) {
         xsqlc_transaction_write(&vtab->transaction);
+        xsqlc_note_vtab_write(vtab->owner, vtab->def->counts_as_write);
     }
     return rc;
 }
@@ -1115,12 +1211,19 @@ xsql_generator_table *xsql_generator_table_new(const char *name,
     }
     memset(t, 0, sizeof(*t));
     t->row_size = row_size;
+    t->counts_as_write = true;
     t->name = xsqlc_strdup(name ? name : "");
     if (!t->name) {
         xsqlc_free(t);
         return NULL;
     }
     return t;
+}
+
+void xsql_generator_counts_as_write(xsql_generator_table *g, bool value) {
+    if (g) {
+        g->counts_as_write = value;
+    }
 }
 
 void xsql_generator_table_free(xsql_generator_table *g) {
@@ -1437,9 +1540,10 @@ int xsql_generator_hidden_col_text(xsql_generator_table *g, const char *name) {
 // Exactly one of `factory` / `factory_projection` is non-NULL; the struct is
 // memset first so the other stays NULL, which is what xFilter branches on.
 static int add_filter(xsql_generator_table *g, const char *column, double cost,
-                      double est_rows, xsql_filter_factory_fn factory,
+                      double est_rows, xsql_filter_op op, xsqlc_key_kind key_kind,
+                      xsql_filter_factory_fn factory,
                       xsql_filter_projection_factory_fn factory_projection,
-                      void *user) {
+                      xsql_filter_like_factory_fn factory_like, void *user) {
     if (!g) {
         return XSQL_MISUSE;
     }
@@ -1457,9 +1561,11 @@ static int add_filter(xsql_generator_table *g, const char *column, double cost,
     f->filter_id = (int)g->nfilters + 1;
     f->cost = cost;
     f->est_rows = est_rows;
-    f->op = XSQL_FILTER_EQ;
+    f->op = op;
+    f->key_kind = (int)key_kind;
     f->factory = factory;
     f->factory_projection = factory_projection;
+    f->factory_like = factory_like;
     f->user = user;
     g->nfilters++;
     return XSQL_OK;
@@ -1468,17 +1574,30 @@ static int add_filter(xsql_generator_table *g, const char *column, double cost,
 int xsql_generator_filter_eq(xsql_generator_table *g, const char *column,
                              double cost, double est_rows,
                              xsql_filter_factory_fn factory, void *user) {
-    return add_filter(g, column, cost, est_rows, factory, NULL, user);
+    return add_filter(g, column, cost, est_rows, XSQL_FILTER_EQ, XSQLC_KEY_INT,
+                      factory, NULL, NULL, user);
 }
 int xsql_generator_filter_eq_text(xsql_generator_table *g, const char *column,
                                   double cost, double est_rows,
                                   xsql_filter_factory_fn factory, void *user) {
-    return add_filter(g, column, cost, est_rows, factory, NULL, user);
+    return add_filter(g, column, cost, est_rows, XSQL_FILTER_EQ, XSQLC_KEY_TEXT,
+                      factory, NULL, NULL, user);
 }
 int xsql_generator_filter_eq_projection(
     xsql_generator_table *g, const char *column, double cost, double est_rows,
     xsql_filter_projection_factory_fn factory, void *user) {
-    return add_filter(g, column, cost, est_rows, NULL, factory, user);
+    return add_filter(g, column, cost, est_rows, XSQL_FILTER_EQ, XSQLC_KEY_INT,
+                      NULL, factory, NULL, user);
+}
+int xsql_generator_filter_like_text(xsql_generator_table *g, const char *column,
+                                    double cost, double est_rows,
+                                    xsql_filter_like_factory_fn factory,
+                                    void *user) {
+    if (!factory) {
+        return XSQL_MISUSE;
+    }
+    return add_filter(g, column, cost, est_rows, XSQL_FILTER_LIKE, XSQLC_KEY_RAW,
+                      NULL, NULL, factory, user);
 }
 
 // As with add_filter: exactly one factory is set, the struct is zeroed first.
@@ -1541,11 +1660,11 @@ int xsql_generator_parametric_filter_projection(
                           user);
 }
 
-int xsql_generator_constraint_filter(xsql_generator_table *g,
-                                     const xsql_constraint_req *reqs,
-                                     size_t nreqs, double cost, double est_rows,
-                                     xsql_generator_constraint_fn factory,
-                                     void *user) {
+// As with add_filter: exactly one factory is set, the struct is zeroed first.
+static int add_constraint_filter(
+    xsql_generator_table *g, const xsql_constraint_req *reqs, size_t nreqs,
+    double cost, double est_rows, xsql_generator_constraint_fn factory,
+    xsql_generator_constraint_projection_fn factory_projection, void *user) {
     if (!g) {
         return XSQL_MISUSE;
     }
@@ -1597,47 +1716,32 @@ int xsql_generator_constraint_filter(xsql_generator_table *g,
     cf->cost = cost;
     cf->est_rows = est_rows;
     cf->factory = factory;
+    cf->factory_projection = factory_projection;
     cf->user = user;
     g->nconstr++;
     return XSQL_OK;
 }
 
-static xsql_constraint_req make_req(const char *column, xsql_constraint_op op,
-                                    bool required, const char *missing_error) {
-    xsql_constraint_req r;
-    r.column = column;
-    r.op = op;
-    r.required = required;
-    r.missing_error = missing_error;
-    return r;
+int xsql_generator_constraint_filter(xsql_generator_table *g,
+                                     const xsql_constraint_req *reqs,
+                                     size_t nreqs, double cost, double est_rows,
+                                     xsql_generator_constraint_fn factory,
+                                     void *user) {
+    return add_constraint_filter(g, reqs, nreqs, cost, est_rows, factory, NULL,
+                                 user);
 }
 
-xsql_constraint_req xsql_required_eq(const char *column,
-                                     const char *missing_error) {
-    return make_req(column, XSQL_CONSTRAINT_EQ, true, missing_error);
+int xsql_generator_constraint_filter_projection(
+    xsql_generator_table *g, const xsql_constraint_req *reqs, size_t nreqs,
+    double cost, double est_rows,
+    xsql_generator_constraint_projection_fn factory, void *user) {
+    if (!factory) {
+        return XSQL_MISUSE;
+    }
+    return add_constraint_filter(g, reqs, nreqs, cost, est_rows, NULL, factory,
+                                 user);
 }
-xsql_constraint_req xsql_required_like(const char *column,
-                                       const char *missing_error) {
-    return make_req(column, XSQL_CONSTRAINT_LIKE, true, missing_error);
-}
-xsql_constraint_req xsql_optional_eq(const char *column) {
-    return make_req(column, XSQL_CONSTRAINT_EQ, false, NULL);
-}
-xsql_constraint_req xsql_optional_like(const char *column) {
-    return make_req(column, XSQL_CONSTRAINT_LIKE, false, NULL);
-}
-xsql_constraint_req xsql_optional_gt(const char *column) {
-    return make_req(column, XSQL_CONSTRAINT_GT, false, NULL);
-}
-xsql_constraint_req xsql_optional_ge(const char *column) {
-    return make_req(column, XSQL_CONSTRAINT_GE, false, NULL);
-}
-xsql_constraint_req xsql_optional_lt(const char *column) {
-    return make_req(column, XSQL_CONSTRAINT_LT, false, NULL);
-}
-xsql_constraint_req xsql_optional_le(const char *column) {
-    return make_req(column, XSQL_CONSTRAINT_LE, false, NULL);
-}
+
 
 void xsql_generator_order_by_consumed(xsql_generator_table *g,
                                       const char *column, bool desc) {

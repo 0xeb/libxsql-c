@@ -66,36 +66,74 @@ char *xsql_format_url_host(const char *host) {
     return norm;
 }
 
+char *xsql_format_connect_url_host(const char *bind_host) {
+    if (bind_host && strcmp(bind_host, "0.0.0.0") == 0) {
+        return xsqlc_strdup("127.0.0.1");
+    }
+    if (bind_host &&
+        (strcmp(bind_host, "::") == 0 || strcmp(bind_host, "[::]") == 0)) {
+        return xsqlc_strdup("[::1]");
+    }
+    return xsql_format_url_host(bind_host);
+}
+
 char *xsql_build_http_clipboard_payload(const char *tool, const char *host,
-                                        int port, const char *sample_sql) {
-    const char *sample = (sample_sql && sample_sql[0]) ? sample_sql : "SELECT 1";
+                                        int port, const char *sample_sql,
+                                        const char *auth_token) {
+    if (!sample_sql || sample_sql[0] == '\0') {
+        return NULL;
+    }
     const char *tool_name = tool ? tool : "";
-    char *hosturl = xsql_format_url_host(host);
+    const bool has_token = auth_token && auth_token[0] != '\0';
+    char *hosturl = xsql_format_connect_url_host(host);
     if (!hosturl) {
+        return NULL;
+    }
+    xsqlc_strbuf base;
+    xsqlc_sb_init(&base);
+    xsqlc_sb_append(&base, "http://");
+    xsqlc_sb_append(&base, hosturl);
+    xsqlc_sb_putc(&base, ':');
+    xsqlc_sb_append_i64(&base, port);
+    xsqlc_free(hosturl);
+    char *base_url = sb_finish(&base);
+    if (!base_url) {
         return NULL;
     }
     xsqlc_strbuf sb;
     xsqlc_sb_init(&sb);
-    xsqlc_sb_append(&sb, "Use ");
     xsqlc_sb_append(&sb, tool_name);
-    xsqlc_sb_append(&sb, " to connect to this ");
-    xsqlc_sb_append(&sb, tool_name);
-    xsqlc_sb_append(&sb, " HTTP server.\n");
-    xsqlc_sb_append(&sb, "curl -X POST http://");
-    xsqlc_sb_append(&sb, hosturl);
-    xsqlc_sb_putc(&sb, ':');
-    xsqlc_sb_append_i64(&sb, port);
-    xsqlc_sb_append(&sb, "/query -d \"");
-    xsqlc_sb_append(&sb, sample);
-    xsqlc_sb_putc(&sb, '"');
-    xsqlc_free(hosturl);
+    xsqlc_sb_append(&sb, " HTTP server at ");
+    xsqlc_sb_append(&sb, base_url);
+    xsqlc_sb_append(&sb,
+                    "\nRead GET /help first (endpoints, schema discovery), then "
+                    "send SQL as the body of POST /query; responses are JSON.\n");
+    if (has_token) {
+        xsqlc_sb_append(&sb,
+                        "Send the Authorization header shown with every "
+                        "request; GET / and GET /help work without it.\n");
+    }
+    xsqlc_sb_append(&sb, "  curl ");
+    xsqlc_sb_append(&sb, base_url);
+    xsqlc_sb_append(&sb, "/help\n  curl -X POST ");
+    xsqlc_sb_append(&sb, base_url);
+    xsqlc_sb_append(&sb, "/query");
+    if (has_token) {
+        xsqlc_sb_append(&sb, " -H \"Authorization: Bearer ");
+        xsqlc_sb_append(&sb, auth_token);
+        xsqlc_sb_putc(&sb, '"');
+    }
+    xsqlc_sb_append(&sb, " --data-binary \"");
+    xsqlc_sb_append(&sb, sample_sql);
+    xsqlc_sb_append(&sb, "\"\n");
+    xsqlc_free(base_url);
     return sb_finish(&sb);
 }
 
 char *xsql_build_mcp_clipboard_payload(const char *server, const char *host,
                                        int port) {
     const char *server_name = server ? server : "";
-    char *hosturl = xsql_format_url_host(host);
+    char *hosturl = xsql_format_connect_url_host(host);
     if (!hosturl) {
         return NULL;
     }

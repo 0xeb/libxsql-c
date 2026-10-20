@@ -317,6 +317,7 @@ void xsqlc_cache_invalidate(const struct xsql_cached_table *def) {
     xsqlc_cache_free_indexes(sc);
     sc->built = false;
     sc->mutation_snapshot = false;
+    ++sc->write_generation;
     sqlite3_mutex_leave(sc->mutex);
 }
 
@@ -331,5 +332,27 @@ void xsqlc_cache_invalidate_after_mutation(const struct xsql_cached_table *def) 
     // Keep `data` alive so an in-flight scan-driven UPDATE/DELETE still sees every
     // row (A1); only mark a snapshot when there is data to preserve (A16).
     sc->mutation_snapshot = sc->data.count > 0;
+    ++sc->write_generation;
     sqlite3_mutex_leave(sc->mutex);
+}
+
+void xsqlc_cache_bump_write_generation(const struct xsql_cached_table *def) {
+    shared_cache *sc = def->shared;
+    if (!sc) {
+        return;
+    }
+    sqlite3_mutex_enter(sc->mutex);
+    ++sc->write_generation;
+    sqlite3_mutex_leave(sc->mutex);
+}
+
+uint64_t xsqlc_cache_write_generation(const struct xsql_cached_table *def) {
+    shared_cache *sc = def->shared;
+    if (!sc) {
+        return 0;
+    }
+    sqlite3_mutex_enter(sc->mutex);
+    const uint64_t g = sc->write_generation;
+    sqlite3_mutex_leave(sc->mutex);
+    return g;
 }

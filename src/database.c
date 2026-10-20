@@ -265,6 +265,51 @@ void xsqlc_db_remove_write_surface(struct xsql_db *db, const char *schema,
 }
 
 // ---------------------------------------------------------------------------
+// Cached-table registrations (connection-wide invalidation)
+// ---------------------------------------------------------------------------
+
+int xsqlc_db_add_cached_binding(struct xsql_db *db,
+                                xsqlc_cached_binding *binding) {
+    if (!db || !db->db || !binding) return XSQL_MISUSE;
+    sqlite3_mutex *mutex = sqlite3_db_mutex(db->db);
+    sqlite3_mutex_enter(mutex);
+    int rc = XSQL_OK;
+    if (db->cached_binding_count == db->cached_binding_cap) {
+        const size_t cap = db->cached_binding_cap ? db->cached_binding_cap * 2 : 8;
+        xsqlc_cached_binding **grown = (xsqlc_cached_binding **)xsqlc_realloc(
+            db->cached_bindings, cap * sizeof(*grown));
+        if (!grown) {
+            rc = XSQL_NO_MEMORY;
+        } else {
+            db->cached_bindings = grown;
+            db->cached_binding_cap = cap;
+        }
+    }
+    if (rc == XSQL_OK) {
+        db->cached_bindings[db->cached_binding_count++] = binding;
+    }
+    sqlite3_mutex_leave(mutex);
+    return rc;
+}
+
+void xsqlc_db_remove_cached_binding(struct xsql_db *db,
+                                    const xsqlc_cached_binding *binding) {
+    if (!db || !binding) return;
+    // Only the module destructor calls this, and SQLite runs it with the
+    // connection mutex already held (inside create_module or close). Taking it
+    // again here would call sqlite3_db_mutex on a connection mid-close.
+    for (size_t i = 0; i < db->cached_binding_count; ++i) {
+        if (db->cached_bindings[i] == binding) {
+            memmove(&db->cached_bindings[i], &db->cached_bindings[i + 1],
+                    (db->cached_binding_count - i - 1) *
+                        sizeof(*db->cached_bindings));
+            db->cached_binding_count--;
+            break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -286,6 +331,11 @@ int xsql_open(const char *path, xsql_db **out) {
     db->preparing_drop = false;
     db->preparing_drop_index = 0;
     db->registry_next = NULL;
+    db->cached_bindings = NULL;
+    db->cached_binding_count = 0;
+    db->cached_binding_cap = 0;
+    db->active_query = NULL;
+    db->vtab_write_count = 0;
 
     int rc = sqlite3_open(path, &db->db);
     if (rc != SQLITE_OK) {
@@ -329,6 +379,14 @@ void xsql_close(xsql_db *db) {
         db->db = NULL;
     }
     unregister_open_database(db);
+    // sqlite3_close ran every module destructor, and each removed its own
+    // binding. Any left over belongs to a connection SQLite refused to close
+    // (unfinalized statements): orphan them so a late destructor never touches
+    // this freed wrapper.
+    for (size_t i = 0; i < db->cached_binding_count; ++i) {
+        db->cached_bindings[i]->owner = NULL;
+    }
+    xsqlc_free(db->cached_bindings);
     for (size_t i = 0; i < db->write_surface_count; ++i) {
         free_write_surface(&db->write_surfaces[i]);
     }
@@ -490,6 +548,33 @@ int64_t xsql_db_last_insert_rowid(const xsql_db *db) {
 
 int xsql_db_changes(const xsql_db *db) {
     return (db && db->db) ? sqlite3_changes(db->db) : 0;
+}
+
+int64_t xsql_db_total_changes(const xsql_db *db) {
+    return (db && db->db) ? (int64_t)sqlite3_total_changes64(db->db) : 0;
+}
+
+uint64_t xsql_db_vtab_write_count(const xsql_db *db) {
+    if (!db || !db->db) {
+        return 0;
+    }
+    // Writes bump the count inside sqlite3_step, which holds the connection
+    // mutex; reading under the same mutex keeps a cross-thread read whole.
+    sqlite3_mutex *mutex = sqlite3_db_mutex(db->db);
+    if (mutex) sqlite3_mutex_enter(mutex);
+    const uint64_t count = db->vtab_write_count;
+    if (mutex) sqlite3_mutex_leave(mutex);
+    return count;
+}
+
+void xsqlc_note_vtab_write(struct xsql_db *owner, bool counts_as_write) {
+    if (!counts_as_write || !owner || !owner->db) {
+        return;
+    }
+    sqlite3_mutex *mutex = sqlite3_db_mutex(owner->db);
+    if (mutex) sqlite3_mutex_enter(mutex);
+    owner->vtab_write_count++;
+    if (mutex) sqlite3_mutex_leave(mutex);
 }
 
 const char *xsql_db_errmsg(const xsql_db *db) {

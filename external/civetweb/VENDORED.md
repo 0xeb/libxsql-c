@@ -16,7 +16,8 @@ Windows vendoring), and a hand-rolled HTTP/1.1 parser (an unnecessary
 network-facing security surface to own).
 
 civetweb is compiled **only** when `XSQLC_WITH_THINCLIENT=ON`, with features
-trimmed to what the thin client uses: `NO_SSL NO_CGI NO_CACHING NO_FILES`. We also
+trimmed to what the thin client uses: `NO_SSL NO_CGI NO_CACHING NO_FILES`, plus
+`USE_IPV6` so a server can listen on, and the client dial, an IPv6 address. We also
 set `SOCKET_TIMEOUT_QUANTUM=200` (upstream default 2000ms) so `mg_stop()` returns
 promptly — the macro is `#ifndef`-guarded upstream, so this is a compile-define
 override, **not** a source patch. The vendored `.c`/`.h`/`.inl` files are pristine.

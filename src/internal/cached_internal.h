@@ -69,6 +69,7 @@ typedef struct {
     double                 cost;
     double                 est_rows;
     xsql_filter_op         op;
+    int                    key_kind;  // xsqlc_key_kind: how the factory reads arg
     xsql_filter_factory_fn factory;
     void                  *user;
 } cached_filter;
@@ -78,6 +79,27 @@ typedef struct {
     xsql_key_extractor_fn key;
     void                 *user;
 } cached_index_def;
+
+// One spec of a cached constraint filter (column + operator + required).
+typedef struct {
+    int                column_index;
+    xsql_constraint_op op;
+    bool               required;
+} cached_constraint_spec;
+
+// A multi-column / multi-operator constraint filter. idxNum = filter_id =
+// CT_CONSTRAINT_FILTER_BASE + position (see table_cached.c). `factory` NULL
+// means cache-backed (xsql_cached_constraint_cache_filter): every spec's column
+// has an index_on whose key supplies the comparison value.
+typedef struct {
+    cached_constraint_spec   *specs;  // owned
+    size_t                    nspecs;
+    int                       filter_id;
+    double                    cost;
+    double                    est_rows;
+    xsql_cached_constraint_fn factory;
+    void                     *user;
+} cached_constraint_filter;
 
 // One (key, row-position) pair of a sorted index. Sorted ascending by key; the
 // row order for equal keys is preserved (stable), so a duplicate key is a
@@ -139,6 +161,11 @@ typedef struct shared_cache {
     size_t                nsorted;
     bool                  built;
     bool                  mutation_snapshot;  // keep data alive across a scan-driven write
+    // Monotonic count of writes through this table (INSERT/UPDATE/DELETE). A
+    // query-scoped cursor-lived cache records the value it was built at and is
+    // reused across that cursor's xFilter calls only while it still matches.
+    // Read and bumped under `mutex`.
+    uint64_t              write_generation;
     struct sqlite3_mutex *mutex;
 } shared_cache;
 
@@ -185,6 +212,8 @@ struct xsql_cached_table {
     size_t            nfilters, filters_cap;
     cached_index_def *index_defs;
     size_t            nindexes, index_cap;
+    cached_constraint_filter *constraints;
+    size_t                    nconstr, constr_cap;
 
     xsql_crow_delete_fn   delete_fn;
     void                 *delete_user;
@@ -207,6 +236,8 @@ struct xsql_cached_table {
 
     bool          update_from_column_values;
     bool          use_shared_cache;
+    // false => writes stay out of xsql_db_vtab_write_count (default true).
+    bool          counts_as_write;
     shared_cache *shared;  // always allocated at _new (unused when non-shared)
 };
 
@@ -240,5 +271,11 @@ void xsqlc_cache_invalidate(const struct xsql_cached_table *def);
 // `data` alive as a mutation snapshot so an in-flight scan-driven write still
 // visits every row.
 void xsqlc_cache_invalidate_after_mutation(const struct xsql_cached_table *def);
+
+// Current write generation (see shared_cache::write_generation); 0 if none.
+uint64_t xsqlc_cache_write_generation(const struct xsql_cached_table *def);
+
+// Record a write through a query-scoped table without touching any data.
+void xsqlc_cache_bump_write_generation(const struct xsql_cached_table *def);
 
 #endif  // XSQLC_INTERNAL_CACHED_INTERNAL_H

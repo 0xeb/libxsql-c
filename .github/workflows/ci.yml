@@ -32,7 +32,8 @@ jobs:
 
       # Configure the full public surface: the static library with the vendored
       # SQLite amalgamation plus the thin-client HTTP server/client (vendored
-      # civetweb). This compiles every shipped translation unit.
+      # civetweb) and its gzip responses (vendored miniz, on by default with the
+      # thin client). This compiles every shipped translation unit.
       - name: Configure
         shell: bash
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DXSQLC_WITH_THINCLIENT=ON

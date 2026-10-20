@@ -65,6 +65,7 @@ typedef struct {
     double                 cost;
     double                 est_rows;
     xsql_filter_op         op;
+    int                    key_kind;  // xsqlc_key_kind: how the factory reads arg
     xsql_filter_factory_fn factory;
     void                  *user;
 } idx_filter;
@@ -79,6 +80,8 @@ struct xsql_table {
     xsql_on_modify_fn     on_modify_fn;
     void                 *on_modify_user;
     xsql_transaction_hooks transaction_hooks;
+    // false => writes stay out of xsql_db_vtab_write_count (default true).
+    bool counts_as_write;
     void                  *transaction_user;
 
     idx_column *columns;
@@ -98,6 +101,72 @@ struct xsql_table {
 // Cursor / vtab wrappers (sqlite base struct first — trampolines cast directly)
 // ---------------------------------------------------------------------------
 
+// A live table's per-statement positional snapshot.
+//
+// A live table's rowid is a position: the index the row held when the statement
+// scanned it. SQLite finishes a write statement's scan before its first xUpdate,
+// so every position it delivers names a row of that scan. A delete removes its
+// row and moves every later row up one, so after the statement's first delete a
+// later position no longer names its scanned row in the live sequence. This
+// ledger keeps the statement's scanned positions meaningful: it records each
+// position the statement deleted, and maps a scanned position to the row's
+// current index by subtracting the deleted positions before it. The snapshot
+// begins empty at the statement's first write and is dropped by the next scan
+// (xFilter), which starts a new statement. A position the statement already
+// deleted names no row. (C++ detail::LiveStatementPositions.)
+typedef struct {
+    size_t *deleted;  // scanned positions this statement deleted, ascending
+    size_t  ndeleted, cap;
+} live_statement_positions;
+
+// Number of deleted positions below `position`; *already_deleted reports whether
+// `position` itself is one.
+static size_t live_positions_rank(const live_statement_positions *p,
+                                  size_t position, bool *already_deleted) {
+    size_t lo = 0, hi = p->ndeleted;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (p->deleted[mid] < position) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    *already_deleted = lo < p->ndeleted && p->deleted[lo] == position;
+    return lo;
+}
+
+// The current index of the row the statement scanned at `position`; false when
+// the statement already deleted that row.
+static bool live_positions_current_index(const live_statement_positions *p,
+                                         size_t position, size_t *index) {
+    bool already_deleted = false;
+    const size_t rank = live_positions_rank(p, position, &already_deleted);
+    if (already_deleted) {
+        return false;
+    }
+    *index = position - rank;
+    return true;
+}
+
+// Room for one more record, reserved before the delete handler runs so recording
+// its success cannot fail.
+static bool live_positions_reserve(live_statement_positions *p) {
+    return xsqlc_vec_reserve((void **)&p->deleted, &p->cap, p->ndeleted + 1,
+                             sizeof(*p->deleted));
+}
+
+// Requires a prior live_positions_reserve.
+static void live_positions_record_delete(live_statement_positions *p,
+                                         size_t position) {
+    bool already_deleted = false;
+    const size_t at = live_positions_rank(p, position, &already_deleted);
+    memmove(&p->deleted[at + 1], &p->deleted[at],
+            (p->ndeleted - at) * sizeof(*p->deleted));
+    p->deleted[at] = position;
+    p->ndeleted++;
+}
+
 typedef struct {
     sqlite3_vtab      base;
     const xsql_table *def;
@@ -105,6 +174,7 @@ typedef struct {
     struct xsql_db   *owner;
     char             *schema_name;
     char             *table_name;
+    live_statement_positions positions;
 } IndexVtab;
 
 typedef struct {
@@ -162,8 +232,16 @@ static void column_emit(const idx_column *c, xsql_context *ctx, size_t row) {
 
 static bool column_set(const idx_column *c, size_t row, xsql_value *val) {
     switch (c->set_kind) {
-        case SET_I64:  return c->set.i64(row, xsql_value_i64(val), c->user);
-        case SET_INT:  return c->set.i(row, xsql_value_int(val), c->user);
+        case SET_I64: {
+            int64_t v = 0;
+            return xsqlc_exact_setter_int64((sqlite3_value *)val, c->name, &v) &&
+                   c->set.i64(row, v, c->user);
+        }
+        case SET_INT: {
+            int v = 0;
+            return xsqlc_exact_setter_int((sqlite3_value *)val, c->name, &v) &&
+                   c->set.i(row, v, c->user);
+        }
         case SET_TEXT: {
             const char *tx = xsql_value_text(val);
             return c->set.text(row, tx ? tx : "", c->user);
@@ -291,6 +369,7 @@ static int index_connect(sqlite3 *db, void *pAux, int argc,
 
 static int index_disconnect(sqlite3_vtab *pVtab) {
     IndexVtab *vtab = (IndexVtab *)pVtab;
+    xsqlc_free(vtab->positions.deleted);
     xsqlc_transaction_destroy(&vtab->transaction);
     xsqlc_free(vtab->schema_name);
     xsqlc_free(vtab->table_name);
@@ -399,6 +478,9 @@ static int index_filter(sqlite3_vtab_cursor *pCursor, int idxNum,
     IndexCursor *cur = (IndexCursor *)pCursor;
     const xsql_table *def = cur->def;
 
+    // A scan starts a new statement: drop the last statement's positions.
+    ((IndexVtab *)pCursor->pVtab)->positions.ndeleted = 0;
+
     cursor_release_iter(cur);
     cur->using_iterator = false;
     cur->iterator_eof = false;
@@ -415,10 +497,26 @@ static int index_filter(sqlite3_vtab_cursor *pCursor, int idxNum,
             cur->iterator_eof = true;
             xsql_row_iter it;
             memset(&it, 0, sizeof(it));
-            if (f->factory((xsql_value *)argv[0], &it, f->user)) {
+            // omit=1 equality: a value the factory's key cannot equal yields no
+            // rows and no call (see xsqlc_eq_filter_arg).
+            sqlite3_value *copy = NULL;
+            const xsqlc_eq_arg how = xsqlc_eq_filter_arg(
+                argv[0], (xsqlc_key_kind)f->key_kind, &copy);
+            if (how == XSQLC_EQ_ARG_OOM) {
+                xsql_vtab_set_error("out of memory");
+                return xsqlc_vtab_return_error(pCursor->pVtab);
+            }
+            xsqlc_vtab_clear_error();
+            if (how != XSQLC_EQ_ARG_NONE &&
+                f->factory((xsql_value *)(copy ? copy : argv[0]), &it, f->user)) {
                 cur->iter = it;
                 cur->has_iter = true;
                 cur->iterator_eof = !cur->iter.next(cur->iter.self);
+            }
+            sqlite3_value_free(copy);
+            if (xsqlc_vtab_has_error()) {
+                cur->iterator_eof = true;
+                return xsqlc_vtab_return_error(pCursor->pVtab);
             }
             return SQLITE_OK;
         }
@@ -437,7 +535,7 @@ static int index_best_index(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
     int best_constraint = -1;
     for (int i = 0; i < info->nConstraint; ++i) {
         const struct sqlite3_index_constraint *c = &info->aConstraint[i];
-        if (!c->usable || c->op != SQLITE_INDEX_CONSTRAINT_EQ) {
+        if (!c->usable || !xsqlc_binary_constraint(info, i) || c->op != SQLITE_INDEX_CONSTRAINT_EQ) {
             continue;
         }
         const idx_filter *f = find_filter_by_column(def, c->iColumn);
@@ -481,6 +579,14 @@ static bool index_update_apply(void *ctx, size_t c, sqlite3_value *val) {
     return column_set(&x->def->columns[c], x->rowid, (xsql_value *)val);
 }
 
+// A position the statement already deleted names no row.
+static int live_row_not_found(sqlite3_vtab *pVtab, const xsql_table *def,
+                              int64_t rowid) {
+    xsqlc_vtab_clear_error();
+    xsql_vtab_set_error("row %lld not found in %s", (long long)rowid, def->name);
+    return xsqlc_vtab_return_error(pVtab);
+}
+
 static int index_update_impl(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
                              sqlite3_int64 *pRowid) {
     (void)pRowid;
@@ -498,15 +604,23 @@ static int index_update_impl(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv
         if (raw_rowid < 0) {
             return SQLITE_ERROR;
         }
-        size_t rowid = (size_t)raw_rowid;
+        const size_t position = (size_t)raw_rowid;
+        size_t index = 0;
+        if (!live_positions_current_index(&vtab->positions, position, &index)) {
+            return live_row_not_found(pVtab, def, raw_rowid);
+        }
+        if (!live_positions_reserve(&vtab->positions)) {
+            return SQLITE_NOMEM;
+        }
         xsqlc_transaction_touch(&vtab->transaction);
         fire_on_modify(def, "DELETE FROM ");
         // Surface the callback's reason (xsql_vtab_set_error) instead of SQLite's
         // generic "SQL logic error", as the INSERT/UPDATE paths already do.
         xsqlc_vtab_clear_error();
-        if (!def->delete_fn(rowid, def->delete_user)) {
+        if (!def->delete_fn(index, def->delete_user)) {
             return xsqlc_vtab_return_error(pVtab);
         }
+        live_positions_record_delete(&vtab->positions, position);
         return SQLITE_OK;
     }
 
@@ -517,7 +631,11 @@ static int index_update_impl(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv
         if (old_raw < 0) {
             return SQLITE_ERROR;
         }
-        size_t old_rowid = (size_t)old_raw;
+        size_t old_rowid = 0;
+        if (!live_positions_current_index(&vtab->positions, (size_t)old_raw,
+                                          &old_rowid)) {
+            return live_row_not_found(pVtab, def, old_raw);
+        }
         xsqlc_transaction_touch(&vtab->transaction);
         fire_on_modify(def, "UPDATE ");
         // The row is resolved positionally by rowid, so NOCHANGE is always honored.
@@ -553,7 +671,9 @@ static int index_update(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
                         sqlite3_int64 *pRowid) {
     int rc = index_update_impl(pVtab, argc, argv, pRowid);
     if (rc == SQLITE_OK) {
-        xsqlc_transaction_write(&((IndexVtab *)pVtab)->transaction);
+        IndexVtab *vtab = (IndexVtab *)pVtab;
+        xsqlc_transaction_write(&vtab->transaction);
+        xsqlc_note_vtab_write(vtab->owner, vtab->def->counts_as_write);
     }
     return rc;
 }
@@ -627,12 +747,19 @@ xsql_table *xsql_table_new(const char *name) {
         return NULL;
     }
     memset(t, 0, sizeof(*t));
+    t->counts_as_write = true;
     t->name = xsqlc_strdup(name ? name : "");
     if (!t->name) {
         xsqlc_free(t);
         return NULL;
     }
     return t;
+}
+
+void xsql_table_counts_as_write(xsql_table *t, bool value) {
+    if (t) {
+        t->counts_as_write = value;
+    }
 }
 
 void xsql_table_free(xsql_table *t) {
@@ -868,8 +995,8 @@ void xsql_table_insertable(xsql_table *t, xsql_insert_fn fn, void *user) {
 }
 
 static int add_filter(xsql_table *t, const char *column, double cost,
-                      double est_rows, xsql_filter_factory_fn factory,
-                      void *user) {
+                      double est_rows, xsqlc_key_kind key_kind,
+                      xsql_filter_factory_fn factory, void *user) {
     if (!t) {
         return XSQL_MISUSE;
     }
@@ -887,6 +1014,7 @@ static int add_filter(xsql_table *t, const char *column, double cost,
     f->cost = cost;
     f->est_rows = est_rows;
     f->op = XSQL_FILTER_EQ;
+    f->key_kind = (int)key_kind;
     f->factory = factory;
     f->user = user;
     t->nfilters++;
@@ -896,14 +1024,14 @@ static int add_filter(xsql_table *t, const char *column, double cost,
 int xsql_table_filter_eq(xsql_table *t, const char *column, double cost,
                          double est_rows, xsql_filter_factory_fn factory,
                          void *user) {
-    return add_filter(t, column, cost, est_rows, factory, user);
+    return add_filter(t, column, cost, est_rows, XSQLC_KEY_INT, factory, user);
 }
 
 int xsql_table_filter_eq_text(xsql_table *t, const char *column, double cost,
                               double est_rows, xsql_filter_factory_fn factory,
                               void *user) {
     // Same EQ pushdown; the factory reads `arg` as text.
-    return add_filter(t, column, cost, est_rows, factory, user);
+    return add_filter(t, column, cost, est_rows, XSQLC_KEY_TEXT, factory, user);
 }
 
 // ---------------------------------------------------------------------------

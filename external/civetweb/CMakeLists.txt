@@ -28,7 +28,10 @@ target_include_directories(civetweb PUBLIC
 # thread only notices a stop request between quanta, so mg_stop() can take up to
 # that long. 200ms keeps server teardown snappy (it is #ifndef-guarded upstream,
 # so this override needs no source patch).
+# USE_IPV6 lets the server listen on an IPv6 address ("[::1]:8100") and the
+# client dial one; without it civetweb rejects a bracketed listening spec.
 target_compile_definitions(civetweb PRIVATE
+    USE_IPV6
     NO_SSL
     NO_CGI
     NO_CACHING

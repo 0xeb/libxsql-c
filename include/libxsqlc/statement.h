@@ -47,9 +47,18 @@ XSQL_API int xsql_stmt_bind_null(xsql_stmt *s, int index);
 XSQL_API int xsql_stmt_bind_int(xsql_stmt *s, int index, int value);
 XSQL_API int xsql_stmt_bind_i64(xsql_stmt *s, int index, int64_t value);
 XSQL_API int xsql_stmt_bind_double(xsql_stmt *s, int index, double value);
+// NUL-terminated text: it stops at the first NUL. Use xsql_stmt_bind_text_len
+// for text that may carry an embedded NUL.
 XSQL_API int xsql_stmt_bind_text(xsql_stmt *s, int index, const char *value);
+// Exactly `len` bytes of UTF-8 text (an embedded NUL is kept).
+XSQL_API int xsql_stmt_bind_text_len(xsql_stmt *s, int index, const char *value,
+                                     size_t len);
+// A zero-length blob is bound as a blob (not SQL NULL), even with data == NULL.
 XSQL_API int xsql_stmt_bind_blob(xsql_stmt *s, int index, const void *data,
                                  size_t size);
+// Number of placeholders in the statement (sqlite3_bind_parameter_count); 0
+// for an invalid statement.
+XSQL_API int xsql_stmt_parameter_count(const xsql_stmt *s);
 
 // Advance the statement one step. Returns XSQL_ROW (a row is available),
 // XSQL_DONE (finished), XSQL_BUSY (retryable lock), or XSQL_ERROR.

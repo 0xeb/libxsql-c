@@ -67,6 +67,13 @@ XSQL_API int xsql_result_cell_bytes(const xsql_result *r, size_t row,
 XSQL_API bool xsql_result_cell_is_null(const xsql_result *r, size_t row,
                                        size_t col);
 
+// SQLite storage class of the cell at (row, col), read before the cell was
+// converted to text: 1 INTEGER, 2 FLOAT, 3 TEXT, 4 BLOB, 5 NULL (the codes
+// xsql_value_type() returns). Lets an embedder hand an integer back as an
+// integer, not its decimal text. 0 for an out-of-range index.
+XSQL_API int xsql_result_cell_type(const xsql_result *r, size_t row,
+                                   size_t col);
+
 // ---------------------------------------------------------------------------
 // Status, warnings, timing
 // ---------------------------------------------------------------------------

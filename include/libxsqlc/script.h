@@ -211,9 +211,17 @@ XSQL_API void xsql_script_result_free(xsql_script_result *r);
 // ---------------------------------------------------------------------------
 
 // Dump `count` tables (or, when names is NULL/count 0, every user table ordered by
-// name) as a self-contained SQL script written to `path`, including the %.16g REAL
-// formatting. Returns XSQL_OK on
-// success, else an error status (the db's error text via xsql_db_errmsg).
+// name) as a self-contained SQL script written to `path`, including round-trip-safe REAL
+// literals. The script opens with "-- SQL Export" and "-- Tables: N", N being
+// the tables actually written.
+//
+// A table that cannot be read without constraints (a virtual table needing a
+// WHERE: a required constraint, or a forbidden full scan) is skipped when
+// exporting every table and named on a "-- Skipped (requires constraints): a, b"
+// header line. Requested by name, it fails the export with XSQL_CONSTRAINT and
+// "Table 'a' cannot be exported: it requires constraints (WHERE) to be read
+// (<the table's reason>)". Returns XSQL_OK on success, else an error status (the
+// db's error text via xsql_db_errmsg); a failed export leaves `path` untouched.
 XSQL_API int xsql_export_tables(struct xsql_db *db, const char *const *names,
                                 size_t count, const char *path);
 

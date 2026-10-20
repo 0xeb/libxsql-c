@@ -56,35 +56,6 @@ typedef struct xsql_generator {
     void *self;
 } xsql_generator;
 
-// Constraint operator matched by a constraint-filter spec.
-typedef enum xsql_constraint_op {
-    XSQL_CONSTRAINT_EQ   = 0,
-    XSQL_CONSTRAINT_GT   = 1,
-    XSQL_CONSTRAINT_LE   = 2,
-    XSQL_CONSTRAINT_LT   = 3,
-    XSQL_CONSTRAINT_GE   = 4,
-    XSQL_CONSTRAINT_LIKE = 5
-} xsql_constraint_op;
-
-// A required/optional constraint request (a plain POD you fill with the helpers
-// below and hand to xsql_generator_constraint_filter). The strings are borrowed
-// only for the duration of that call.
-typedef struct xsql_constraint_req {
-    const char        *column;         // constrained column name
-    xsql_constraint_op op;             // operator to match
-    bool               required;       // fail the query if absent (see below)
-    const char        *missing_error;  // error text when a required spec is absent
-} xsql_constraint_req;
-
-// One pushed-down constraint value handed to a constraint-filter factory. The
-// factory sees which column and operator each value belongs to (needed to build
-// range predicates). `value` is borrowed for the duration of the factory call.
-typedef struct xsql_constraint_arg {
-    int                column_index;
-    xsql_constraint_op op;
-    xsql_value        *value;
-} xsql_constraint_arg;
-
 // ---------------------------------------------------------------------------
 // Callback signatures (each takes the per-registration `user` pointer last).
 // ---------------------------------------------------------------------------
@@ -142,6 +113,17 @@ typedef bool (*xsql_generator_parametric_projection_fn)(int argc, xsql_value **a
 typedef bool (*xsql_generator_constraint_fn)(int argc,
                                              const xsql_constraint_arg *args,
                                              xsql_generator *out, void *user);
+// Projection-aware constraint factory: the constraint factory plus the same
+// colUsed bitmask as xsql_generator_make_projection_fn.
+typedef bool (*xsql_generator_constraint_projection_fn)(
+    int argc, const xsql_constraint_arg *args, uint64_t col_used,
+    xsql_generator *out, void *user);
+// LIKE pushdown factory (xsql_generator_filter_like_text): receives the raw LIKE
+// pattern (e.g. "foo%", "" for a NULL) and colUsed. It may return a SUPERSET of
+// the matching rows; SQLite re-applies the real pattern to every row.
+typedef bool (*xsql_filter_like_factory_fn)(const char *pattern,
+                                            uint64_t col_used,
+                                            xsql_row_iter *out, void *user);
 
 // ---------------------------------------------------------------------------
 // Lifecycle + table configuration
@@ -180,6 +162,10 @@ XSQL_API void xsql_generator_after_modify(xsql_generator_table *g,
 // clears the lifecycle. Returns XSQL_OK or XSQL_MISUSE.
 XSQL_API int xsql_generator_transaction_hooks(
     xsql_generator_table *g, const xsql_transaction_hooks *hooks, void *user);
+// Whether this table's row writes bump xsql_db_vtab_write_count() (default:
+// true); a session/bookkeeping table passes false.
+XSQL_API void xsql_generator_counts_as_write(xsql_generator_table *g,
+                                             bool value);
 
 // ---------------------------------------------------------------------------
 // Columns (declared in order). Each returns XSQL_OK / XSQL_NO_MEMORY.
@@ -204,6 +190,13 @@ XSQL_API int xsql_generator_col_blob(xsql_generator_table *g, const char *name,
 XSQL_API int xsql_generator_col_rw(xsql_generator_table *g, const char *name,
                                    xsql_column_type type, xsql_grow_emit_fn get,
                                    xsql_grow_set_value_fn set, void *user);
+// A typed integer setter (int / i64 *_rw) is called only with the integer the
+// written value equals under SQLite's INTEGER comparison: 16, 16.0 and '16'
+// all arrive as 16. Anything else -- NULL, a blob, 16.5, '0x10', 'abc', or for
+// the int variant an integer outside int32 -- refuses the write with
+// `column "<name>": expected an integer, got ...` (or `... does not fit a
+// 32-bit integer`) and the setter does not run. A raw-value variant receives
+// the value as written.
 XSQL_API int xsql_generator_col_int_rw(xsql_generator_table *g, const char *name,
                                        xsql_grow_int_fn get,
                                        xsql_grow_set_int_fn set, void *user);
@@ -258,7 +251,10 @@ XSQL_API int xsql_generator_hidden_col_text(xsql_generator_table *g,
 // ---------------------------------------------------------------------------
 
 // Single-column equality pushdown (factory reads `arg` as int / text). Bypasses
-// the generator entirely via an xsql_row_iter.
+// the generator entirely via an xsql_row_iter. The constraint is consumed, so
+// the value is compared the way SQLite compares the column: the int factory is
+// called only for a value an integer can equal (never 10.5, 'a', NULL or a
+// blob, which yield no rows), the text factory never for NULL or a blob.
 XSQL_API int xsql_generator_filter_eq(xsql_generator_table *g, const char *column,
                                       double cost, double est_rows,
                                       xsql_filter_factory_fn factory, void *user);
@@ -268,12 +264,26 @@ XSQL_API int xsql_generator_filter_eq_text(xsql_generator_table *g,
                                            xsql_filter_factory_fn factory,
                                            void *user);
 
-// Projection-aware single-column equality pushdown: exactly filter_eq(), except
-// the factory also receives colUsed. Strictly additive — a table that never
+// Projection-aware single-column equality pushdown: exactly filter_eq() (an
+// integer key, the same exact-value rule), except the factory also receives
+// colUsed. Strictly additive — a table that never
 // registers one of these plans and behaves byte-for-byte as before.
 XSQL_API int xsql_generator_filter_eq_projection(
     xsql_generator_table *g, const char *column, double cost, double est_rows,
     xsql_filter_projection_factory_fn factory, void *user);
+
+// `WHERE <column> LIKE ?` pushdown for one text column. Always a best-effort
+// superset: xBestIndex claims the constraint only when the pattern has a usable
+// literal prefix (not a leading wildcard; a bound parameter is claimed), and
+// leaves it unconsumed so SQLite re-checks the real pattern on every row, so
+// correctness never depends on the factory filtering exactly. The factory gets
+// colUsed because a LIKE can match far more rows than an EQ lookup. GLOB
+// constraints are not matched. Competes with filter_eq filters on cost.
+XSQL_API int xsql_generator_filter_like_text(xsql_generator_table *g,
+                                             const char *column, double cost,
+                                             double est_rows,
+                                             xsql_filter_like_factory_fn factory,
+                                             void *user);
 
 // Parametric filter: fires only when EVERY listed column has a usable equality
 // constraint; the values reach the factory in `columns` order.
@@ -293,7 +303,8 @@ XSQL_API int xsql_generator_parametric_filter_projection(
 
 // General multi-operator constraint filter. A required spec that is absent fails
 // the query with its missing_error (or, when that is empty, falls through to a
-// full scan). Build `reqs` with the helpers below.
+// full scan). Build `reqs` with the xsql_required_* / xsql_optional_* helpers
+// in <libxsqlc/vtab.h>.
 XSQL_API int xsql_generator_constraint_filter(xsql_generator_table *g,
                                               const xsql_constraint_req *reqs,
                                               size_t nreqs, double cost,
@@ -301,17 +312,15 @@ XSQL_API int xsql_generator_constraint_filter(xsql_generator_table *g,
                                               xsql_generator_constraint_fn factory,
                                               void *user);
 
-// Constraint-request helpers (fill an xsql_constraint_req by value).
-XSQL_API xsql_constraint_req xsql_required_eq(const char *column,
-                                              const char *missing_error);
-XSQL_API xsql_constraint_req xsql_required_like(const char *column,
-                                                const char *missing_error);
-XSQL_API xsql_constraint_req xsql_optional_eq(const char *column);
-XSQL_API xsql_constraint_req xsql_optional_like(const char *column);
-XSQL_API xsql_constraint_req xsql_optional_gt(const char *column);
-XSQL_API xsql_constraint_req xsql_optional_ge(const char *column);
-XSQL_API xsql_constraint_req xsql_optional_lt(const char *column);
-XSQL_API xsql_constraint_req xsql_optional_le(const char *column);
+// Projection-aware constraint filter: exactly constraint_filter(), except the
+// factory also receives colUsed (see filter_eq_projection). Strictly additive: a
+// plain constraint filter's plan and its idxStr are unchanged; only this variant
+// carries colUsed (as a "<colUsed>;" prefix on its idxStr). A plain and a
+// projection-aware filter may be registered on the same columns.
+XSQL_API int xsql_generator_constraint_filter_projection(
+    xsql_generator_table *g, const xsql_constraint_req *reqs, size_t nreqs,
+    double cost, double est_rows,
+    xsql_generator_constraint_projection_fn factory, void *user);
 
 // Tag the most-recently-added constraint filter as emitting rows already sorted
 // by `column` (ascending unless `desc`), so SQLite can elide the ORDER BY.

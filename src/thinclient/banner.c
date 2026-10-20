@@ -29,6 +29,12 @@ char *xsql_format_http_info(int port, const char *bind_address,
     if (!host) {
         return NULL;
     }
+    // The example is dialed, so a wildcard bind shows its loopback there.
+    char *connect_host = xsql_format_connect_url_host(bind_address);
+    if (!connect_host) {
+        xsqlc_free(host);
+        return NULL;
+    }
     xsqlc_strbuf sb;
     xsqlc_sb_init(&sb);
     xsqlc_sb_append(&sb, "HTTP server started on port ");
@@ -46,14 +52,15 @@ char *xsql_format_http_info(int port, const char *bind_address,
                     "  POST /shutdown - Stop server\n\n"
                     "Example:\n"
                     "  curl -X POST http://");
-    xsqlc_sb_append(&sb, host);
+    xsqlc_sb_append(&sb, connect_host);
     xsqlc_sb_putc(&sb, ':');
     xsqlc_sb_append_i64(&sb, port);
     xsqlc_sb_append(&sb,
-                    "/query -d \"SELECT name FROM sqlite_master WHERE "
+                    "/query --data-binary \"SELECT name FROM sqlite_master WHERE "
                     "type='table' LIMIT 10\"\n\n");
     xsqlc_sb_append(&sb, hint);
     xsqlc_sb_putc(&sb, '\n');
+    xsqlc_free(connect_host);
     xsqlc_free(host);
     return sb_finish(&sb);
 }

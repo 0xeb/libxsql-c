@@ -51,7 +51,8 @@ target_link_libraries(your_target PRIVATE xsqlc::xsqlc)
 | Option | Default | Effect |
 | --- | --- | --- |
 | `XSQLC_WITH_THINCLIENT` | `OFF` | Build the HTTP thin-client layer; headers ship no-op stubs when off |
-| `XSQLC_SHARED` | `OFF` | Build libxsql-c as a shared library (DLL/.so) instead of a static archive. Only the `XSQL_API` surface is exported; vendored SQLite/civetweb symbols are hidden. Release memory returned by the library with `xsql_free()` across the boundary |
+| `XSQLC_WITH_GZIP` | `ON` with the thin client | gzip-compress HTTP responses when the client sends `Accept-Encoding: gzip` (vendored miniz). Forced off without the thin client; turn it off if your host already statically links another miniz |
+| `XSQLC_SHARED` | `OFF` | Build libxsql-c as a shared library (DLL/.so) instead of a static archive. Only the `XSQL_API` surface is exported; vendored SQLite/civetweb/miniz symbols are hidden. Release memory returned by the library with `xsql_free()` across the boundary |
 | `XSQLC_BUILD_EXAMPLES` | on when standalone | Build the bundled examples |
 
 ## Conventions
@@ -106,7 +107,34 @@ xsql_close(db);
 
 Prepared statements (`<libxsqlc/statement.h>`) are available for bind/step/column
 loops: `xsql_db_prepare` → `xsql_stmt_bind_*` → `xsql_stmt_step` →
-`xsql_stmt_col_*` → `xsql_stmt_finalize`.
+`xsql_stmt_col_*` → `xsql_stmt_finalize`. `xsql_stmt_bind_text` reads a
+NUL-terminated string; `xsql_stmt_bind_text_len` binds exactly `len` bytes, so
+an embedded NUL is kept.
+
+Bound parameters also run through the materialized envelope, under the same
+timeout, cancellation and partial-result rules as `xsql_db_query_opts`. Each
+cell carries its SQLite storage class, read before it was converted to text:
+
+```c
+xsql_param params[2] = {
+    { .type = XSQL_PARAM_INT64, .i64 = 0x401000 },
+    { .type = XSQL_PARAM_TEXT, .data = "a\0b", .len = 3 },
+};
+xsql_result *r = NULL;
+xsql_db_query_params(db, "SELECT name, size FROM items WHERE addr = ? AND tag = ?",
+                     params, 2, NULL, &r);
+if (xsql_result_ok(r) && xsql_result_cell_type(r, 0, 1) == 1 /* INTEGER */) { /* ... */ }
+xsql_result_free(r);
+```
+
+`?`, `?NNN`, `:name`, `@name` and `$name` placeholders all bind by position. A
+parameter count that differs from the statement's is an error ("statement has
+N parameter(s), M value(s) given"), and the statement does not run. A
+zero-length blob binds as a blob, never as SQL NULL.
+
+`xsql_db_total_changes(db)` counts the rows changed on the connection since it
+opened; `xsql_db_vtab_write_count(db)` counts only virtual-table row writes
+(see Virtual tables).
 
 ### Scalar and aggregate functions
 
@@ -124,9 +152,17 @@ static void add2(xsql_context *ctx, int argc, xsql_value **argv, void *user) {
         xsql_result_error(ctx, "add2 expects 2 arguments");
 }
 
-xsql_db_create_function(db, "add2", 2, add2, /*user*/ NULL, /*destroy*/ NULL);
+xsql_db_create_function(db, "add2", 2, XSQL_FUNCTION_DETERMINISTIC, add2,
+                        /*user*/ NULL, /*destroy*/ NULL);
 // ... SELECT add2(20, 22);  -> 42
 ```
+
+A scalar function is not deterministic unless it passes
+`XSQL_FUNCTION_DETERMINISTIC`, which is SQLite's own default. SQLite may
+evaluate a deterministic call with constant arguments once and reuse the value,
+which is wrong for a function with side effects, so such a function passes
+`XSQL_FUNCTION_NONE`. A pure function like `add2` opts in, which also allows it
+in index expressions.
 
 `xsql_db_create_aggregate` registers a step + final pair; per-aggregation state
 lives in the `xsql_aggregate_state(ctx)` slot.
@@ -158,11 +194,17 @@ xsql_table_register(db, t);      // CREATE VIRTUAL TABLE names ...
 xsql_table_free(t);              // after every db it was registered into closes
 ```
 
+A live table's rowid is the row's position when the statement scanned it. A
+multi-row DELETE hands each `xsql_delete_fn` call the row's current index: the
+scanned position minus the rows the same statement already deleted before it.
+So a handler that erases by index removes exactly the rows the statement
+matched; the next scan starts fresh.
+
 **Cached tables** (`<libxsqlc/table_cached.h>`) materialize rows once into a
 contiguous cache of fixed-size records and reuse them across queries, with lazy
-hash indexes (`xsql_cached_index_on`), constraint/prefix pushdown, a COUNT(\*)
-fast path, and full UPDATE/DELETE/INSERT. A cache builder pushes records via
-`xsql_rowset_push`:
+hash indexes (`xsql_cached_index_on`, which also serve range pushdown),
+equality/prefix pushdown, a COUNT(\*) fast path, and full
+UPDATE/DELETE/INSERT. A cache builder pushes records via `xsql_rowset_push`:
 
 ```c
 struct Row { int64_t id; };
@@ -176,22 +218,69 @@ xsql_cached_table *c = xsql_cached_table_new("ids", sizeof(struct Row));
 xsql_cached_cache_builder(c, build, NULL);
 xsql_cached_col_i64(c, "id", get_id, NULL);
 xsql_cached_table_register(db, c);
-xsql_cached_table_free(c);
+// ... SELECT id FROM ids;
+xsql_cached_table_free(c);       // after every db it was registered into closes
 ```
+
+Rows are rebuilt only after a write through the table. When the source changes
+by other means (a scalar function that renames, re-analyzes, or redefines what
+the rows read), invalidate explicitly: `xsql_cached_invalidate(c)` for one
+definition, `xsql_db_invalidate_cached_tables(db)` (or
+`xsql_invalidate_cached_tables(sqlite3 *)`) for every cached table on a
+connection, and `xsql_context_invalidate_cached_tables(ctx)` from inside a
+scalar function. Each does exactly what a write does: a scan already in flight
+keeps its rows, and every later probe or statement rebuilds.
+
+Predicates spanning several columns or operators, such as interval
+containment (`p.v >= i.start AND p.v < i.end`), which SQLite would otherwise
+run as a cross product, get a constraint filter. Build the specs with the
+`xsql_required_*` / `xsql_optional_*` helpers from `<libxsqlc/vtab.h>`:
+
+```c
+const xsql_constraint_req contains[] = {
+    xsql_required_le("start", NULL),
+    xsql_required_gt("end", NULL),
+};
+// In memory, over the index_on keys of both columns:
+xsql_cached_constraint_cache_filter(c, contains, 2, /*cost=*/1.0, /*rows=*/1.0);
+// ...or exact, from your own source:
+// xsql_cached_constraint_filter(c, contains, 2, 1.0, 1.0, factory, user);
+```
+
+The cheapest filter whose required specs are all present wins, provided it is
+cheaper than the table's equality plans. Consumed constraints are not
+re-checked by SQLite, so a factory must return exactly the matching rows. The
+in-memory form compares the way SQLite does: NULL never matches, a numeric
+string compares as its number, and other text sorts after every integer.
 
 **Generator tables** (`<libxsqlc/table_generator.h>`) are a streaming source that
 never materializes, so `LIMIT` stops work early — you supply an
 `xsql_generator` (`next`/`current`/`rowid`/`destroy`) via a factory, plus
 hidden columns, parametric/constraint filters, and ORDER BY elision.
 `xsql_generator_count` adds an opt-in exact `COUNT(*)` path that does not create
-or walk a generator. `xsql_generator_filter_eq_projection` and
-`xsql_generator_parametric_filter_projection` pass the statement's used-column
+or walk a generator. `xsql_generator_filter_eq_projection`,
+`xsql_generator_parametric_filter_projection` and
+`xsql_generator_constraint_filter_projection` pass the statement's used-column
 mask to the filter, so a source can skip computing columns the query never reads.
+`xsql_generator_filter_like_text` pushes `WHERE col LIKE 'prefix%'` down to a
+factory that may return a superset (SQLite re-checks the pattern); a pattern
+with a leading wildcard falls back to the full scan. Every filter kind competes
+on its cost: the cheapest matching single-column, parametric or constraint
+filter drives the scan, a single-column filter winning a tie, so a cheap name
+lookup beats a costly range on `WHERE name = 'x' AND addr > 0x1000`.
 
 All three table flavors support a full transaction lifecycle through
 `xsql_transaction_hooks`: connection-local state, prepare/commit/rollback, and
 savepoint/release/rollback-to callbacks. Failed mutation callbacks still arm
 rollback, while read-only statements and schema creation never fire commit.
+
+Every row write a table's callback carries out bumps the connection's
+`xsql_db_vtab_write_count(db)`, so an embedder can ask "did a host-backed table
+change since X?" by comparing two readings. Temp and ordinary SQLite tables
+never count (unlike `xsql_db_total_changes`), a refused write does not count,
+and a later `ROLLBACK` does not lower it. A session or bookkeeping table opts out
+with `xsql_table_counts_as_write(t, false)` (or `xsql_cached_counts_as_write` /
+`xsql_generator_counts_as_write`); the runtime settings table does.
 
 ### Scripts, export, and formatters
 
@@ -211,6 +300,13 @@ xsql_script_result_free(sr);
 
 xsql_export_tables(db, /*names*/ NULL, /*count*/ 0, "dump.sql");       // SQL dump
 ```
+
+An all-tables `xsql_export_tables` skips a table that cannot be read without a
+`WHERE` and names it on a `-- Skipped (requires constraints): ...` header line;
+`-- Tables: N` counts the tables written. Naming such a table explicitly fails
+the export with `XSQL_CONSTRAINT`. A generator table refuses an unconstrained
+scan (a missing required constraint, or `xsql_generator_full_scan_error`) with
+its own message and `SQLITE_CONSTRAINT`.
 
 `xsql_script_split` splits a script into statements; `xsql_print_table` renders
 a standalone ASCII table. For large results,
@@ -253,6 +349,12 @@ xsql_result_free(r);
 Long native virtual-table scans poll `xsql_vtab_interrupted()` so they bail at
 the same deadline; embedders can install their own predicate with
 `xsql_vtab_set_interrupt_checker`.
+
+A query issued on the same connection while another one runs (from a scalar
+function or an embedded host-language bridge) stays inside the enclosing
+query's budget: it stops at its own deadline or the enclosing one, whichever
+comes first, and when the enclosing query is cancelled, even with no timeout
+of its own. A query on another connection keeps its own budget.
 
 ### Runtime settings
 
@@ -310,11 +412,28 @@ vendored civetweb (MIT); no transport type appears in any public header.
   When a token is configured, `/status` requires it by default; set
   `status_requires_auth = XSQL_HTTP_STATUS_AUTH_PUBLIC` only when an
   unauthenticated liveness endpoint is intentional.
-  `POST /query` accepts a raw-SQL or JSON body and a `?format=json|text|csv|tsv`
-  selector. Queue admission failures use exact HTTP statuses (503 full/stopped,
-  408 timeout), and the admission deadline ends once execution starts. Port `0`
-  tries `[8100,8999]`, then atomically asks the kernel for an available
-  ephemeral port if that band is exhausted.
+  `POST /query` accepts a raw-SQL or JSON body and a
+  `?format=json|jsonl|text|csv|tsv` selector (jsonl is one record per row,
+  served as `application/x-ndjson`). An `X-XSQL-Timeout: <ms>` header becomes
+  the executor's `timeout_ms`. Queue admission failures use exact HTTP statuses
+  (503 full/stopped, 408 timeout), and the admission deadline ends once
+  execution starts. Port `0` tries `[8100,8999]`, then atomically asks the
+  kernel for an available ephemeral port if that band is exhausted.
+  Connections are kept alive, so a batch client can send many queries over one
+  connection (an idle one closes after 500 ms).
+  - **Streaming:** set `stream_executor` (same shape as
+    `xsql_db_stream_script_json` / `_ndjson`) and a client sending
+    `X-XSQL-Stream: 1` (JSON envelope) or `X-XSQL-Stream: ndjson` gets a
+    `Transfer-Encoding: chunked` response written row by row with bounded
+    memory. Writes are batched into 64 KiB chunks by an `xsql_stream_coalescer`
+    (public, for reuse). While streaming, `?format=` must be `json`, or `jsonl`
+    with the ndjson header.
+  - **Cancellation:** `POST /cancel` interrupts an in-flight `script_executor`
+    query, and then calls an optional `cancel_fn` so an adapter can forward the
+    cancellation downstream; a hook failure is a 502.
+  - **gzip:** with `XSQLC_WITH_GZIP`, every route's JSON/NDJSON/text response,
+    streamed or not, is gzip'd when the client sends `Accept-Encoding: gzip`
+    (never `text/event-stream`).
 - **`http_client.h`** — `xsql_http_client` with `query` / `status` / `cancel` /
   `shutdown` / `ping` (response bodies are heap strings freed with `xsql_free`).
 - **`thinclient_cli.h`** — `xsql_parse_cli_args` for direct / serve / client
@@ -348,6 +467,6 @@ You may not maintain a divergent private fork, port, rebrand, clone, API-compati
 
 Permission requests: open a GitHub issue at [0xeb/libxsql-c/issues](https://github.com/0xeb/libxsql-c/issues).
 
-If libxsql-c materially informs a distributed project, preserve the human origin: credit libxsql-c and Elias Bachaalany visibly in your README/docs and in About/credits UI when applicable. The license includes an examples/FAQ section for common allowed and permission-required uses. Third-party dependencies (vendored SQLite (public domain) and civetweb (MIT)) remain under their own licenses.
+If libxsql-c materially informs a distributed project, preserve the human origin: credit libxsql-c and Elias Bachaalany visibly in your README/docs and in About/credits UI when applicable. The license includes an examples/FAQ section for common allowed and permission-required uses. Third-party dependencies (vendored SQLite (public domain), civetweb (MIT) and miniz (MIT)) remain under their own licenses.
 
 See the full [Human-Origin Source License v1.0](LICENSE).

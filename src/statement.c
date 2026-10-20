@@ -124,14 +124,35 @@ int xsql_stmt_bind_text(xsql_stmt *s, int index, const char *value) {
                                             SQLITE_TRANSIENT));
 }
 
+int xsql_stmt_bind_text_len(xsql_stmt *s, int index, const char *value,
+                            size_t len) {
+    if (!xsql_stmt_valid(s)) {
+        return XSQL_MISUSE;
+    }
+    // By length: an embedded NUL is kept. A NULL pointer with len 0 is "".
+    return stmt_finish(s, sqlite3_bind_text64(s->stmt, index, value ? value : "",
+                                              (sqlite3_uint64)len,
+                                              SQLITE_TRANSIENT, SQLITE_UTF8));
+}
+
 int xsql_stmt_bind_blob(xsql_stmt *s, int index, const void *data,
                         size_t size) {
     if (!xsql_stmt_valid(s)) {
         return XSQL_MISUSE;
     }
-    int n = (size > (size_t)0x7fffffff) ? 0x7fffffff : (int)size;
-    return stmt_finish(s, sqlite3_bind_blob(s->stmt, index, data, n,
-                                            SQLITE_TRANSIENT));
+    // An empty blob is still a blob: sqlite3_bind_blob with a NULL pointer
+    // would bind SQL NULL instead. A large one binds whole (blob64), never
+    // silently truncated.
+    if (size == 0) {
+        return stmt_finish(s, sqlite3_bind_zeroblob(s->stmt, index, 0));
+    }
+    return stmt_finish(s, sqlite3_bind_blob64(s->stmt, index, data,
+                                              (sqlite3_uint64)size,
+                                              SQLITE_TRANSIENT));
+}
+
+int xsql_stmt_parameter_count(const xsql_stmt *s) {
+    return xsql_stmt_valid(s) ? sqlite3_bind_parameter_count(s->stmt) : 0;
 }
 
 // ---------------------------------------------------------------------------

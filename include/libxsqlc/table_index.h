@@ -59,7 +59,15 @@ typedef bool (*xsql_col_set_text_fn)(size_t row, const char *val, void *user);
 // Nullable setter receives the raw value so it can detect a SQL NULL assignment.
 typedef bool (*xsql_col_set_value_fn)(size_t row, xsql_value *val, void *user);
 
-// DELETE handler: remove row index `row`.
+// DELETE handler: remove the row at index `row`; return true on success, or
+// false after calling xsql_vtab_set_error(). `row` is the row's current index:
+// in a multi-row DELETE, a row the statement scanned at position p arrives as p
+// minus the rows the statement already deleted before it (rows after a deleted
+// one move up), so a handler that erases by index removes exactly the rows the
+// statement matched. The adjustment lasts one statement; the next scan starts
+// fresh. A position the statement already deleted fails with
+// "row <id> not found in <table>" before any hook runs. The setters above
+// receive the same current index.
 typedef bool (*xsql_delete_fn)(size_t row, void *user);
 // INSERT handler: create a row from `argc` column values.
 typedef bool (*xsql_insert_fn)(int argc, xsql_value **argv, void *user);
@@ -84,6 +92,10 @@ XSQL_API void xsql_table_on_modify(xsql_table *t, xsql_on_modify_fn fn, void *us
 // clears the lifecycle. Returns XSQL_OK or XSQL_MISUSE.
 XSQL_API int xsql_table_transaction_hooks(
     xsql_table *t, const xsql_transaction_hooks *hooks, void *user);
+// Whether this table's row writes bump the connection's
+// xsql_db_vtab_write_count() (default: true). A session/bookkeeping table
+// (settings, checkpoints, previews) passes false.
+XSQL_API void xsql_table_counts_as_write(xsql_table *t, bool value);
 
 // ---------------------------------------------------------------------------
 // Columns (declared in order; the column index is its position). Read-only
@@ -102,6 +114,13 @@ XSQL_API int xsql_table_col_text(xsql_table *t, const char *name,
 XSQL_API int xsql_table_col_blob(xsql_table *t, const char *name,
                                  xsql_col_emit_fn get, void *user);
 
+// A typed integer setter (int / i64 *_rw) is called only with the integer the
+// written value equals under SQLite's INTEGER comparison: 16, 16.0 and '16'
+// all arrive as 16. Anything else -- NULL, a blob, 16.5, '0x10', 'abc', or for
+// the int variant an integer outside int32 -- refuses the write with
+// `column "<name>": expected an integer, got ...` (or `... does not fit a
+// 32-bit integer`) and the setter does not run. A raw-value variant receives
+// the value as written.
 XSQL_API int xsql_table_col_int_rw(xsql_table *t, const char *name,
                                    xsql_col_int_fn get, xsql_col_set_int_fn set,
                                    void *user);
@@ -126,10 +145,14 @@ XSQL_API void xsql_table_insertable(xsql_table *t, xsql_insert_fn fn, void *user
 
 // ---------------------------------------------------------------------------
 // Constraint pushdown. Register an equality filter on a column: a WHERE
-// column = ? uses the factory's iterator instead of a full scan. `filter_eq`
-// and `filter_eq_text` are the same EQ pushdown — the factory reads `arg` as an
-// integer or as text respectively. Returns XSQL_OK, XSQL_NO_MEMORY, or
-// XSQL_NOT_FOUND if `column` is not a declared column.
+// column = ? uses the factory's iterator instead of a full scan. The
+// constraint is consumed (SQLite does not re-check the rows), so the value is
+// compared the way SQLite compares the column. `filter_eq`'s factory reads
+// `arg` as an integer and is called only for a value an integer can equal
+// (10, 10.0, '10', '1e1' -- never 10.5, 'a', NULL or a blob, which yield no
+// rows). `filter_eq_text`'s factory reads `arg` as text and is never called
+// for NULL or a blob. Returns XSQL_OK, XSQL_NO_MEMORY, or XSQL_NOT_FOUND if
+// `column` is not a declared column.
 // ---------------------------------------------------------------------------
 
 XSQL_API int xsql_table_filter_eq(xsql_table *t, const char *column, double cost,

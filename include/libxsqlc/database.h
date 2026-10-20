@@ -147,6 +147,46 @@ XSQL_API int xsql_db_query(xsql_db *db, const char *sql, xsql_result **out);
 XSQL_API int xsql_db_query_opts(xsql_db *db, const char *sql,
                                 const xsql_query_opts *opts, xsql_result **out);
 
+// A query issued on the same connection while another xsql_db_query* call runs
+// (from a scalar function or an embedded host-language bridge) stays inside the
+// enclosing query's budget: it stops at its own deadline or the enclosing one,
+// whichever comes first, and when the enclosing query is cancelled, even with
+// no timeout_ms or should_cancel of its own. An inherited deadline reports
+// xsql_result_timed_out(); an inherited cancel reports "Query cancelled". A
+// query on another connection keeps its own budget.
+
+// One bound statement parameter for xsql_db_query_params(). Fill `type` and the
+// matching field: `i64` for XSQL_PARAM_INT64, `f64` for XSQL_PARAM_DOUBLE, and
+// `data` + `len` for XSQL_PARAM_TEXT / XSQL_PARAM_BLOB. Text binds by `len`, so
+// an embedded NUL is kept (it need not be NUL-terminated). A zero-length blob is
+// a blob, not SQL NULL, even when `data` is NULL. The bytes are copied.
+typedef enum xsql_param_type {
+    XSQL_PARAM_NULL   = 0,
+    XSQL_PARAM_INT64  = 1,
+    XSQL_PARAM_DOUBLE = 2,
+    XSQL_PARAM_TEXT   = 3,
+    XSQL_PARAM_BLOB   = 4
+} xsql_param_type;
+
+typedef struct xsql_param {
+    xsql_param_type type;
+    int64_t         i64;
+    double          f64;
+    const void     *data;
+    size_t          len;
+} xsql_param;
+
+// As xsql_db_query_opts(), with `params` bound to the statement's placeholders
+// first (`?`, `?NNN`, `:name`, `@name`, `$name` all bind by position from 1).
+// Same timeout, cancellation and partial-result rules. When `param_count`
+// differs from the statement's parameter count the result carries the error
+// "statement has N parameter(s), M value(s) given" and the statement does not
+// run. `params` may be NULL when `param_count` is 0.
+XSQL_API int xsql_db_query_params(xsql_db *db, const char *sql,
+                                  const xsql_param *params, size_t param_count,
+                                  const xsql_query_opts *opts,
+                                  xsql_result **out);
+
 // ---------------------------------------------------------------------------
 // Function registration
 //
@@ -155,9 +195,22 @@ XSQL_API int xsql_db_query_opts(xsql_db *db, const char *sql,
 // registration itself fails, so the library never double-frees `user`.
 // ---------------------------------------------------------------------------
 
+// Flags for xsql_db_create_function(), OR-ed into `flags`.
+//
+// A scalar function is NOT deterministic unless it says so (SQLite's own
+// default): every call runs. That is required for a function with side effects
+// or whose result follows state that can change between calls, because SQLite
+// may evaluate a deterministic constant-argument call once and reuse the value.
+// A pure function passes XSQL_FUNCTION_DETERMINISTIC (which also allows it in
+// index expressions).
+typedef enum xsql_function_flags {
+    XSQL_FUNCTION_NONE          = 0,
+    XSQL_FUNCTION_DETERMINISTIC = 1u << 0
+} xsql_function_flags;
+
 XSQL_API int xsql_db_create_function(xsql_db *db, const char *name, int argc,
-                                     xsql_scalar_fn fn, void *user,
-                                     void (*destroy)(void *));
+                                     unsigned flags, xsql_scalar_fn fn,
+                                     void *user, void (*destroy)(void *));
 
 XSQL_API int xsql_db_create_aggregate(xsql_db *db, const char *name, int argc,
                                       xsql_aggregate_step_fn step,
@@ -170,6 +223,19 @@ XSQL_API int xsql_db_create_aggregate(xsql_db *db, const char *name, int argc,
 
 XSQL_API int64_t xsql_db_last_insert_rowid(const xsql_db *db);
 XSQL_API int     xsql_db_changes(const xsql_db *db);
+
+// Rows changed by INSERT/UPDATE/DELETE on this connection since it opened
+// (sqlite3_total_changes64), virtual-table writes included. 0 when closed.
+XSQL_API int64_t xsql_db_total_changes(const xsql_db *db);
+
+// Row writes accepted by this connection's virtual tables since it opened:
+// every INSERT, UPDATE or DELETE a table's write callback carried out, on tables
+// that count as writes (see xsql_table_counts_as_write and its cached/generator
+// twins). Temp and ordinary SQLite tables are not included; a refused write does
+// not count; a later ROLLBACK does not lower it (a host write is not undone by
+// SQLite). Compare two readings to ask "did a host-backed table change since
+// X?". 0 when closed.
+XSQL_API uint64_t xsql_db_vtab_write_count(const xsql_db *db);
 
 // Last error text for this connection (borrowed; valid until the next API call
 // on the same db). Never NULL.

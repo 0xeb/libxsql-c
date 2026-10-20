@@ -5,9 +5,9 @@
 // See LICENSE.
 //
 // clipboard.h — thin-client clipboard/URL/payload helpers: host normalization,
-// HTTP/MCP clipboard payload builders, server-output parsing, and a Windows
-// clipboard copy (no-op elsewhere; macOS is intentionally deferred). All heap
-// results are released with xsql_free().
+// HTTP/MCP clipboard payload builders, server-output parsing, and a clipboard
+// copy (Windows clipboard, macOS `pbcopy`; no-op elsewhere). All heap results
+// are released with xsql_free().
 //
 // Feature-gated with the rest of the thin client (built under
 // XSQL_HAS_THINCLIENT); no-op stubs otherwise.
@@ -29,12 +29,25 @@ extern "C" {
 XSQL_API char *xsql_normalize_clipboard_host(const char *host);
 // Normalize then bracket a bare IPv6 literal ("::1" => "[::1]"). Heap.
 XSQL_API char *xsql_format_url_host(const char *host);
-// "Use <tool> ...\ncurl -X POST http://<host>:<port>/query -d \"<sql>\"".
-// sample_sql NULL => "SELECT 1". Heap.
+// The host a client should dial for a server bound to `bind_host`: a wildcard
+// bind (0.0.0.0, ::) is not dialable, so it maps to its loopback (127.0.0.1,
+// [::1]); anything else is xsql_format_url_host. Heap.
+XSQL_API char *xsql_format_connect_url_host(const char *bind_host);
+// Paste-ready instructions for an agent reaching the HTTP server:
+//   "<tool> HTTP server at http://<host>:<port>\n"
+//   "Read GET /help first (...), then send SQL as the body of POST /query; ...\n"
+//   ["Send the Authorization header shown with every request; ...\n"]
+//   "  curl http://<host>:<port>/help\n"
+//   "  curl -X POST http://<host>:<port>/query [-H \"Authorization: Bearer <token>\"]"
+//   " --data-binary \"<sql>\"\n"
+// <host> is xsql_format_connect_url_host(host). sample_sql is required
+// (NULL/"" => NULL) and must not contain '"'. auth_token NULL/"" => no
+// Authorization line or header. Heap.
 XSQL_API char *xsql_build_http_clipboard_payload(const char *tool,
                                                  const char *host, int port,
-                                                 const char *sample_sql);
-// The mcpServers JSON block pointing at http://<host>:<port>/sse. Heap.
+                                                 const char *sample_sql,
+                                                 const char *auth_token);
+// The mcpServers JSON block pointing at http://<connect host>:<port>/sse. Heap.
 XSQL_API char *xsql_build_mcp_clipboard_payload(const char *server,
                                                 const char *host, int port);
 // If `output` begins with `prefix` followed by digits, parse the port (>0) into
@@ -54,8 +67,9 @@ XSQL_API bool xsql_extract_http_start_endpoint(const char *output,
 // As above for an "MCP server started on port <N>" line + an "SSE endpoint: " URL.
 XSQL_API bool xsql_extract_mcp_start_endpoint(const char *output,
                                               char **out_host, int *out_port);
-// Copy UTF-8 `text` to the Windows clipboard. Returns false on non-Windows, on
-// empty text, or on any Win32 failure. A test override (below) intercepts it.
+// Copy UTF-8 `text` to the clipboard (Windows clipboard; macOS via `pbcopy`).
+// Returns false on other platforms, on empty text, or on any copy failure. A
+// test override (below) intercepts it.
 XSQL_API bool xsql_copy_text_to_clipboard(const char *text);
 // Install a test override for xsql_copy_text_to_clipboard (NULL clears it).
 XSQL_API void xsql_set_clipboard_copy_override(bool (*fn)(const char *text,
@@ -72,10 +86,15 @@ static inline char *xsql_format_url_host(const char *host) {
     (void)host;
     return NULL;
 }
+static inline char *xsql_format_connect_url_host(const char *bind_host) {
+    (void)bind_host;
+    return NULL;
+}
 static inline char *xsql_build_http_clipboard_payload(const char *tool,
                                                       const char *host, int port,
-                                                      const char *sample_sql) {
-    (void)tool; (void)host; (void)port; (void)sample_sql;
+                                                      const char *sample_sql,
+                                                      const char *auth_token) {
+    (void)tool; (void)host; (void)port; (void)sample_sql; (void)auth_token;
     return NULL;
 }
 static inline char *xsql_build_mcp_clipboard_payload(const char *server,

@@ -48,6 +48,9 @@ typedef struct xsql_http_response xsql_http_response;
 // Status out-sink, borrowed inside a status_fn. Emit exactly one JSON object.
 typedef struct xsql_http_status_out xsql_http_status_out;
 
+// Write coalescer for streamed responses (see "Streaming write coalescer").
+typedef struct xsql_stream_coalescer xsql_stream_coalescer;
+
 // ---------------------------------------------------------------------------
 // Callback typedefs
 //
@@ -95,6 +98,26 @@ typedef size_t (*xsql_http_max_queue_fn)(void *user);
 
 // Interrupt check polled by run_until_stopped; return true to stop the server.
 typedef bool (*xsql_http_interrupt_fn)(void *user);
+
+// Downstream cancellation hook for POST /cancel (see cancel_fn below). Return 0
+// when the cancellation was forwarded. Nonzero reports a failure: the server
+// answers 502 "local cancellation requested, but downstream propagation failed"
+// followed by ": <err>" when the hook wrote a message into `err`, a buffer of
+// `err_size` bytes (always >= 1) that arrives NUL-terminated and empty. Must be
+// thread-safe and must not block beyond its own bounded control request.
+typedef int (*xsql_http_cancel_fn)(char *err, size_t err_size, void *user);
+
+// Chunked-response executor (see stream_executor below). Write the response
+// body through sink(data, len, sink_user): the JSON envelope row by row, or one
+// JSON object per line when `ndjson` is true. xsql_db_stream_script_json /
+// _ndjson have exactly this shape. Once sink returns false the client is gone;
+// stop producing. The status line and headers are already sent when this runs,
+// so a failure can only be reported inside the stream.
+typedef void (*xsql_http_stream_executor_fn)(const char *script,
+                                             const xsql_script_opts *opts,
+                                             bool ndjson,
+                                             xsql_stream_sink_fn sink,
+                                             void *sink_user, void *user);
 
 // ---------------------------------------------------------------------------
 // Extra routes (transport-neutral; declarative)
@@ -144,7 +167,12 @@ typedef struct xsql_http_server_config {
     const char *auth_token;             // NULL/"" => no auth required
     bool        allow_insecure_no_auth; // permit a non-loopback bind without a token
 
-    // Executor precedence: script_executor > statement_executor > query_fn.
+    // Executor precedence: script_executor > statement_executor > query_fn
+    // (stream_executor, at the end of this struct, takes a request first when
+    // the client opts in with X-XSQL-Stream). Every executor that receives
+    // xsql_script_opts gets the request's `X-XSQL-Timeout: <ms>` header as
+    // opts->timeout_ms (absent or unparseable leaves 0, "no limit"; values
+    // above INT_MAX clamp to INT_MAX).
     xsql_http_script_executor_fn script_executor;
     void                        *script_executor_user;
     xsql_script_executor_fn      statement_executor;
@@ -184,6 +212,27 @@ typedef struct xsql_http_server_config {
     // with 413 before the body is read. 0 => the built-in default (64 MiB),
     // matching the C++ http_query_server_config::max_request_body_bytes.
     size_t max_request_body_bytes;
+
+    // ABI-growth fields: optional out-of-band cancellation hook. POST /cancel
+    // advances the local cooperative-cancel epoch first, then calls
+    // cancel_fn(err, err_size, cancel_user) so an adapter blocked inside a
+    // downstream call can forward the cancellation without waiting for that
+    // call to return. /cancel is a 409 (and the hook is not called) unless a
+    // script_executor is configured. NULL => no downstream propagation.
+    xsql_http_cancel_fn cancel_fn;
+    void               *cancel_user;
+
+    // ABI-growth fields: optional true chunked-response executor, for engines
+    // that can produce a result row by row with bounded memory. Used only when
+    // the client sends `X-XSQL-Stream: 1` / `true` (JSON envelope) or
+    // `X-XSQL-Stream: ndjson` (one object per row per line) on POST /query and
+    // use_queue is false; otherwise the header is ignored and /query takes the
+    // buffered executors above. The response is Transfer-Encoding: chunked,
+    // written through an xsql_stream_coalescer. serialize_requests holds its gate
+    // for the whole stream. While streaming, ?format= must be json, or jsonl with
+    // `X-XSQL-Stream: ndjson`; anything else is a 400 before the executor runs.
+    xsql_http_stream_executor_fn stream_executor;
+    void                        *stream_user;
 } xsql_http_server_config;
 
 // ---------------------------------------------------------------------------
@@ -225,7 +274,11 @@ XSQL_API int  xsql_http_server_start(xsql_http_server *s);
 XSQL_API void xsql_http_server_stop(xsql_http_server *s);
 XSQL_API bool xsql_http_server_is_running(const xsql_http_server *s);
 XSQL_API int  xsql_http_server_port(const xsql_http_server *s);
-// "http://<bind>:<port>" — heap; free with xsql_free(); NULL on allocation fail.
+// "http://<bind>:<port>": the bind address as configured, IPv6 bracketed
+// ("http://[::1]:8100"); a wildcard bind is reported as bound
+// ("http://0.0.0.0:8100", "http://[::]:8100") -- the dialable form is
+// xsql_format_connect_url_host. Heap; free with xsql_free(); NULL on
+// allocation fail.
 XSQL_API char *xsql_http_server_url(const xsql_http_server *s);
 
 // Queue mode (use_queue=true): drive queued commands on the owner thread.
@@ -236,6 +289,53 @@ XSQL_API bool xsql_http_server_process_one_command(xsql_http_server *s);
 XSQL_API void xsql_http_server_set_interrupt_check(xsql_http_server *s,
                                                    xsql_http_interrupt_fn fn,
                                                    void *user);
+
+// ---------------------------------------------------------------------------
+// Streaming write coalescer
+//
+// A streaming executor emits one sink call per row. Forwarding each call to the
+// transport costs one chunk frame and one socket write per row, which made a
+// streamed bulk pull several times slower than the buffered one for the same
+// bytes. The coalescer batches those calls into flush_threshold_bytes-sized
+// physical writes and leaves the byte stream unchanged. The server wraps every
+// streamed /query response in one; it is public so an embedder streaming
+// through its own transport can reuse it. Not thread-safe (one per stream).
+//
+// Once real_write returns false (a disconnected client) or a buffer allocation
+// fails, the coalescer latches: every later write/flush returns false without
+// calling real_write again, so an emitter's "sink returned false -> stop" check
+// keeps working, detected up to one buffer later.
+// ---------------------------------------------------------------------------
+
+// The server's threshold: large enough to cut the write count by orders of
+// magnitude, small enough that the first bytes still leave within a few hundred
+// rows.
+#define XSQL_STREAM_COALESCE_BYTES ((size_t)64 * 1024)
+
+// Create a coalescer over `real_write(data, len, real_user)`. Returns XSQL_OK,
+// XSQL_MISUSE (NULL out / real_write, or a zero threshold), or XSQL_NO_MEMORY.
+XSQL_API int  xsql_stream_coalescer_new(xsql_stream_sink_fn real_write,
+                                        void *real_user,
+                                        size_t flush_threshold_bytes,
+                                        xsql_stream_coalescer **out);
+// Buffer `len` bytes, flushing once the buffer reaches the threshold. Returns
+// false once the coalescer has failed.
+XSQL_API bool xsql_stream_coalescer_write(xsql_stream_coalescer *c,
+                                          const char *data, size_t len);
+// xsql_stream_sink_fn adapter: pass it with `user` = the coalescer to hand the
+// coalescer to an emitter such as xsql_db_stream_script_json.
+XSQL_API bool xsql_stream_coalescer_sink(const char *data, size_t len,
+                                         void *coalescer);
+// Send any buffered remainder. Idempotent; never issues an empty write.
+// Returns false once the coalescer has failed.
+XSQL_API bool xsql_stream_coalescer_flush(xsql_stream_coalescer *c);
+// True once a real write or a buffer allocation has failed.
+XSQL_API bool xsql_stream_coalescer_failed(const xsql_stream_coalescer *c);
+// Number of real_write calls made so far (exposed for tests and diagnostics).
+XSQL_API size_t xsql_stream_coalescer_real_write_count(
+    const xsql_stream_coalescer *c);
+// Release without flushing. Passing NULL is a no-op.
+XSQL_API void xsql_stream_coalescer_free(xsql_stream_coalescer *c);
 
 // ---------------------------------------------------------------------------
 // Banner formatters (standalone; no server handle needed) — heap strings freed
@@ -294,6 +394,40 @@ static inline void xsql_http_server_set_interrupt_check(xsql_http_server *s,
                                                         void *user) {
     (void)s; (void)fn; (void)user;
 }
+static inline int xsql_stream_coalescer_new(xsql_stream_sink_fn real_write,
+                                            void *real_user,
+                                            size_t flush_threshold_bytes,
+                                            xsql_stream_coalescer **out) {
+    (void)real_write; (void)real_user; (void)flush_threshold_bytes;
+    if (out) {
+        *out = NULL;
+    }
+    return XSQL_ERROR;  // thin client not enabled
+}
+static inline bool xsql_stream_coalescer_write(xsql_stream_coalescer *c,
+                                               const char *data, size_t len) {
+    (void)c; (void)data; (void)len;
+    return false;
+}
+static inline bool xsql_stream_coalescer_sink(const char *data, size_t len,
+                                              void *coalescer) {
+    (void)data; (void)len; (void)coalescer;
+    return false;
+}
+static inline bool xsql_stream_coalescer_flush(xsql_stream_coalescer *c) {
+    (void)c;
+    return false;
+}
+static inline bool xsql_stream_coalescer_failed(const xsql_stream_coalescer *c) {
+    (void)c;
+    return true;
+}
+static inline size_t xsql_stream_coalescer_real_write_count(
+    const xsql_stream_coalescer *c) {
+    (void)c;
+    return 0;
+}
+static inline void xsql_stream_coalescer_free(xsql_stream_coalescer *c) { (void)c; }
 static inline char *xsql_format_http_info(int port, const char *bind_address,
                                           const char *stop_hint) {
     (void)port; (void)bind_address; (void)stop_hint;

@@ -63,10 +63,18 @@ bool xsqlc_vtab_has_error(void) {
 
 int xsqlc_vtab_return_error(struct sqlite3_vtab *pVtab) {
     if (xsqlc_vtab_has_error() && pVtab) {
+        // SQLite frees zErrMsg only when it consumes it; free a message an
+        // earlier assignment left so a second one does not leak it.
+        sqlite3_free(pVtab->zErrMsg);
         pVtab->zErrMsg = sqlite3_mprintf("%s", g_vtab_error);
     }
     xsqlc_vtab_clear_error();
     return SQLITE_ERROR;
+}
+
+int xsqlc_vtab_return_refusal(struct sqlite3_vtab *pVtab) {
+    xsqlc_vtab_return_error(pVtab);
+    return SQLITE_CONSTRAINT_VTAB;
 }
 
 // --- Prepare-time authorizer denial channel (thread-local) -------------------
@@ -325,4 +333,400 @@ int xsqlc_create_vtable_sqlite(struct sqlite3 *db, const char *table_name,
     }
     sqlite3_free(sql);
     return rc;
+}
+
+bool xsqlc_resolve_cmp_value(sqlite3_value *v, xsqlc_cmp_value *out) {
+    memset(out, 0, sizeof(*out));
+    int type = sqlite3_value_type(v);
+    if (type == SQLITE_TEXT) {
+        // Numeric affinity on a private copy: applying it to argv itself would
+        // change the type of the caller's value (e.g. an outer JOIN column).
+        sqlite3_value *copy = sqlite3_value_dup(v);
+        if (!copy) {
+            return false;
+        }
+        type = sqlite3_value_numeric_type(copy);
+        out->i = sqlite3_value_int64(copy);
+        out->d = sqlite3_value_double(copy);
+        sqlite3_value_free(copy);
+    } else {
+        out->i = sqlite3_value_int64(v);
+        out->d = sqlite3_value_double(v);
+    }
+    out->kind = type == SQLITE_BLOB ? SQLITE_TEXT : type;
+    if (out->kind == SQLITE_FLOAT && out->d != out->d) {
+        out->kind = SQLITE_NULL;  // NaN compares like NULL
+    }
+    return true;
+}
+
+bool xsqlc_cmp_exact_key(const xsqlc_cmp_value *cv, int64_t *key) {
+    if (cv->kind == SQLITE_INTEGER) {
+        *key = cv->i;
+        return true;
+    }
+    if (cv->kind == SQLITE_FLOAT && cv->d >= -9223372036854775808.0 &&
+        cv->d < 9223372036854775808.0 && (double)(int64_t)cv->d == cv->d) {
+        *key = (int64_t)cv->d;
+        return true;
+    }
+    return false;
+}
+
+bool xsqlc_exact_setter_int64(sqlite3_value *v, const char *column,
+                              int64_t *out) {
+    const char *got = "NULL";
+    switch (sqlite3_value_type(v)) {
+        case SQLITE_INTEGER:
+            *out = sqlite3_value_int64(v);
+            return true;
+        case SQLITE_FLOAT:
+        case SQLITE_TEXT: {
+            xsqlc_cmp_value cv;
+            if (!xsqlc_resolve_cmp_value(v, &cv)) {
+                xsql_vtab_set_error("out of memory");
+                return false;
+            }
+            if (xsqlc_cmp_exact_key(&cv, out)) {
+                return true;
+            }
+            got = sqlite3_value_type(v) == SQLITE_FLOAT
+                      ? "a non-integral or out-of-range real"
+                      : "non-integer text";
+            break;
+        }
+        case SQLITE_BLOB:
+            got = "a blob";
+            break;
+        default:
+            break;
+    }
+    xsql_vtab_set_error("column \"%s\": expected an integer, got %s", column, got);
+    return false;
+}
+
+bool xsqlc_exact_setter_int(sqlite3_value *v, const char *column, int *out) {
+    int64_t wide = 0;
+    if (!xsqlc_exact_setter_int64(v, column, &wide)) {
+        return false;
+    }
+    if (wide < INT32_MIN || wide > INT32_MAX) {
+        xsql_vtab_set_error("column \"%s\": %lld does not fit a 32-bit integer",
+                            column, (long long)wide);
+        return false;
+    }
+    *out = (int)wide;
+    return true;
+}
+
+int xsqlc_cmp_bound(const xsqlc_cmp_value *cv, bool is_low, bool *strict,
+                    int64_t *bound) {
+    switch (cv->kind) {
+        case SQLITE_NULL:
+            return XSQLC_BOUND_EMPTY;
+        case SQLITE_INTEGER:
+            *bound = cv->i;
+            return XSQLC_BOUND_SET;
+        case SQLITE_FLOAT: {
+            const double d = cv->d;
+            if (d >= 9223372036854775808.0) {
+                return is_low ? XSQLC_BOUND_EMPTY : XSQLC_BOUND_NONE;
+            }
+            if (d < -9223372036854775808.0) {
+                return is_low ? XSQLC_BOUND_NONE : XSQLC_BOUND_EMPTY;
+            }
+            const int64_t t = (int64_t)d;  // truncated toward zero
+            if ((double)t == d) {
+                *bound = t;
+                return XSQLC_BOUND_SET;
+            }
+            // Non-integral: key > d <=> key >= ceil(d); key < d <=> key <= floor(d).
+            // Strictness no longer matters once the bound is the nearest integer.
+            *strict = false;
+            if (is_low) {
+                *bound = d > 0 ? t + 1 : t;  // ceil
+            } else {
+                *bound = d > 0 ? t : t - 1;  // floor
+            }
+            return XSQLC_BOUND_SET;
+        }
+        default:
+            // Text and blobs sort after every number.
+            return is_low ? XSQLC_BOUND_EMPTY : XSQLC_BOUND_NONE;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public factory helpers (xsql_exact_int64 / xsql_exact_text /
+// xsql_int64_key_range): the comparison the built-in omit=1 plans use.
+// ---------------------------------------------------------------------------
+
+bool xsql_exact_int64(xsql_value *value, int64_t *out) {
+    xsqlc_cmp_value cv;
+    if (!value || !out) {
+        return false;
+    }
+    if (!xsqlc_resolve_cmp_value((sqlite3_value *)value, &cv)) {
+        xsql_vtab_set_error("out of memory");
+        return false;
+    }
+    return xsqlc_cmp_exact_key(&cv, out);
+}
+
+const char *xsql_exact_text(xsql_value *value) {
+    if (!value) {
+        return NULL;
+    }
+    const int type = sqlite3_value_type((sqlite3_value *)value);
+    if (type == SQLITE_NULL || type == SQLITE_BLOB) {
+        return NULL;  // NULL equals nothing; a blob never equals text
+    }
+    const char *text = (const char *)sqlite3_value_text((sqlite3_value *)value);
+    if (!text) {
+        xsql_vtab_set_error("out of memory");  // a number's rendering failed
+    }
+    return text;
+}
+
+void xsql_int64_key_range_init(xsql_int64_key_range *range) {
+    if (!range) {
+        return;
+    }
+    range->lower = INT64_MIN;
+    range->upper = INT64_MAX;
+    range->empty = false;
+}
+
+static bool key_range_set_empty(xsql_int64_key_range *range) {
+    range->empty = true;
+    return false;
+}
+
+static bool key_range_apply(xsql_int64_key_range *range, xsql_constraint_op op,
+                            const xsqlc_cmp_value *cv) {
+    int64_t b = 0;
+    bool strict = op == XSQL_CONSTRAINT_GT || op == XSQL_CONSTRAINT_LT;
+    switch (op) {
+        case XSQL_CONSTRAINT_EQ:
+            if (!xsqlc_cmp_exact_key(cv, &b)) {
+                return key_range_set_empty(range);
+            }
+            if (b > range->lower) range->lower = b;
+            if (b < range->upper) range->upper = b;
+            break;
+        case XSQL_CONSTRAINT_GT:
+        case XSQL_CONSTRAINT_GE:
+            switch (xsqlc_cmp_bound(cv, true, &strict, &b)) {
+                case XSQLC_BOUND_EMPTY:
+                    return key_range_set_empty(range);
+                case XSQLC_BOUND_NONE:
+                    break;
+                default:
+                    if (strict) {
+                        if (b == INT64_MAX) {
+                            return key_range_set_empty(range);
+                        }
+                        b += 1;
+                    }
+                    if (b > range->lower) range->lower = b;
+                    break;
+            }
+            break;
+        case XSQL_CONSTRAINT_LT:
+        case XSQL_CONSTRAINT_LE:
+            switch (xsqlc_cmp_bound(cv, false, &strict, &b)) {
+                case XSQLC_BOUND_EMPTY:
+                    return key_range_set_empty(range);
+                case XSQLC_BOUND_NONE:
+                    break;
+                default:
+                    if (strict) {
+                        if (b == INT64_MIN) {
+                            return key_range_set_empty(range);
+                        }
+                        b -= 1;
+                    }
+                    if (b < range->upper) range->upper = b;
+                    break;
+            }
+            break;
+        case XSQL_CONSTRAINT_LIKE:
+        default:
+            xsql_vtab_set_error("LIKE is not an integer key comparison");
+            return key_range_set_empty(range);
+    }
+    if (range->lower > range->upper) {
+        range->empty = true;
+    }
+    return !range->empty;
+}
+
+bool xsql_int64_key_range_constrain(xsql_int64_key_range *range,
+                                    xsql_constraint_op op, xsql_value *value) {
+    if (!range) {
+        return false;
+    }
+    xsqlc_cmp_value cv;
+    if (!value) {
+        memset(&cv, 0, sizeof(cv));
+        cv.kind = SQLITE_NULL;
+    } else if (!xsqlc_resolve_cmp_value((sqlite3_value *)value, &cv)) {
+        xsql_vtab_set_error("out of memory");
+        return key_range_set_empty(range);
+    }
+    return key_range_apply(range, op, &cv);
+}
+
+bool xsql_int64_key_range_constrain_int64(xsql_int64_key_range *range,
+                                          xsql_constraint_op op, int64_t value) {
+    if (!range) {
+        return false;
+    }
+    xsqlc_cmp_value cv;
+    memset(&cv, 0, sizeof(cv));
+    cv.kind = SQLITE_INTEGER;
+    cv.i = value;
+    cv.d = (double)value;
+    return key_range_apply(range, op, &cv);
+}
+
+bool xsql_int64_key_range_empty(const xsql_int64_key_range *range) {
+    return !range || range->empty;
+}
+
+bool xsql_int64_key_range_contains(const xsql_int64_key_range *range,
+                                   int64_t key) {
+    return range && !range->empty && key >= range->lower && key <= range->upper;
+}
+
+int xsql_int64_key_range_unsigned_spans(const xsql_int64_key_range *range,
+                                        int descending, xsql_u64_span out[2]) {
+    if (!range || !out || range->empty || range->lower > range->upper) return 0;
+    const uint64_t lo = (uint64_t)range->lower;
+    const uint64_t hi = (uint64_t)range->upper;
+    if (range->lower < 0 && range->upper >= 0) {
+        const xsql_u64_span high = {lo, UINT64_MAX};
+        const xsql_u64_span low = {0, hi};
+        out[0] = descending ? low : high;
+        out[1] = descending ? high : low;
+        return 2;
+    }
+    out[0].lo = lo;
+    out[0].hi = hi;
+    return 1;
+}
+
+xsqlc_eq_arg xsqlc_eq_filter_arg(sqlite3_value *v, xsqlc_key_kind kind,
+                                 sqlite3_value **copy) {
+    *copy = NULL;
+    const int type = sqlite3_value_type(v);
+    if (kind == XSQLC_KEY_TEXT) {
+        // NULL equals nothing and a blob never equals text; a number gets the
+        // column's TEXT affinity, which is exactly xsql_value_text's rendering.
+        return type == SQLITE_NULL || type == SQLITE_BLOB ? XSQLC_EQ_ARG_NONE
+                                                          : XSQLC_EQ_ARG_PASS;
+    }
+    if (kind != XSQLC_KEY_INT) {
+        return XSQLC_EQ_ARG_PASS;
+    }
+    xsqlc_cmp_value cv;
+    int64_t key = 0;
+    if (!xsqlc_resolve_cmp_value(v, &cv)) {
+        return XSQLC_EQ_ARG_OOM;
+    }
+    if (!xsqlc_cmp_exact_key(&cv, &key)) {
+        return XSQLC_EQ_ARG_NONE;
+    }
+    if (type != SQLITE_TEXT) {
+        // An integer, or an integral real: sqlite3_value_int64 is exact.
+        return XSQLC_EQ_ARG_PASS;
+    }
+    // Numeric text: sqlite3_value_int64 would stop at the first non-digit
+    // ('1e1' reads as 1), so hand over a numeric copy instead.
+    *copy = sqlite3_value_dup(v);
+    if (!*copy) {
+        return XSQLC_EQ_ARG_OOM;
+    }
+    (void)sqlite3_value_numeric_type(*copy);
+    return XSQLC_EQ_ARG_COPY;
+}
+
+bool xsqlc_like_constraint_has_usable_prefix(sqlite3_index_info *info, int i) {
+    sqlite3_value *rhs = NULL;
+    int rc = sqlite3_vtab_rhs_value(info, i, &rhs);
+    if (rc != SQLITE_OK || !rhs) {
+        return true;  // unknown at plan time: claim; the filter stays a superset
+    }
+    const unsigned char *text = sqlite3_value_text(rhs);
+    if (!text) {
+        return false;
+    }
+    char c0 = (char)text[0];
+    return c0 != '\0' && c0 != '%' && c0 != '_' && c0 != '\\';
+}
+
+int xsqlc_constraint_sqlite_op(xsql_constraint_op op) {
+    switch (op) {
+        case XSQL_CONSTRAINT_GT:   return SQLITE_INDEX_CONSTRAINT_GT;
+        case XSQL_CONSTRAINT_LE:   return SQLITE_INDEX_CONSTRAINT_LE;
+        case XSQL_CONSTRAINT_LT:   return SQLITE_INDEX_CONSTRAINT_LT;
+        case XSQL_CONSTRAINT_GE:   return SQLITE_INDEX_CONSTRAINT_GE;
+        case XSQL_CONSTRAINT_LIKE: return SQLITE_INDEX_CONSTRAINT_LIKE;
+        case XSQL_CONSTRAINT_EQ:
+        default:                   return SQLITE_INDEX_CONSTRAINT_EQ;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Constraint-request helpers (declared in <libxsqlc/vtab.h>)
+// ---------------------------------------------------------------------------
+
+static xsql_constraint_req make_req(const char *column, xsql_constraint_op op,
+                                    bool required, const char *missing_error) {
+    xsql_constraint_req r;
+    r.column = column;
+    r.op = op;
+    r.required = required;
+    r.missing_error = missing_error;
+    return r;
+}
+
+xsql_constraint_req xsql_required_eq(const char *column,
+                                     const char *missing_error) {
+    return make_req(column, XSQL_CONSTRAINT_EQ, true, missing_error);
+}
+xsql_constraint_req xsql_required_gt(const char *column,
+                                     const char *missing_error) {
+    return make_req(column, XSQL_CONSTRAINT_GT, true, missing_error);
+}
+xsql_constraint_req xsql_required_le(const char *column,
+                                     const char *missing_error) {
+    return make_req(column, XSQL_CONSTRAINT_LE, true, missing_error);
+}
+xsql_constraint_req xsql_required_like(const char *column,
+                                       const char *missing_error) {
+    return make_req(column, XSQL_CONSTRAINT_LIKE, true, missing_error);
+}
+xsql_constraint_req xsql_optional_eq(const char *column) {
+    return make_req(column, XSQL_CONSTRAINT_EQ, false, NULL);
+}
+xsql_constraint_req xsql_optional_like(const char *column) {
+    return make_req(column, XSQL_CONSTRAINT_LIKE, false, NULL);
+}
+xsql_constraint_req xsql_optional_gt(const char *column) {
+    return make_req(column, XSQL_CONSTRAINT_GT, false, NULL);
+}
+xsql_constraint_req xsql_optional_ge(const char *column) {
+    return make_req(column, XSQL_CONSTRAINT_GE, false, NULL);
+}
+xsql_constraint_req xsql_optional_lt(const char *column) {
+    return make_req(column, XSQL_CONSTRAINT_LT, false, NULL);
+}
+xsql_constraint_req xsql_optional_le(const char *column) {
+    return make_req(column, XSQL_CONSTRAINT_LE, false, NULL);
+}
+
+int xsqlc_binary_constraint(const sqlite3_index_info *info, int index) {
+    const char *name = sqlite3_vtab_collation((sqlite3_index_info *)info, index);
+    return name && sqlite3_stricmp(name, "BINARY") == 0;
 }

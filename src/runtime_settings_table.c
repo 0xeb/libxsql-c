@@ -510,6 +510,8 @@ xsql_runtime_settings_table *xsql_runtime_settings_table_new(
         return NULL;
     }
     xsql_cached_no_shared_cache(table->definition);
+    // Session settings, not host data: an UPDATE here is not a host write.
+    xsql_cached_counts_as_write(table->definition, false);
     xsql_cached_estimate_rows(
         table->definition, runtime_estimate, table);
     xsql_cached_stateful_cache_builder(

@@ -18,6 +18,11 @@ external/sqlite/sqlite3.h -diff
 external/sqlite/shell.c -diff
 external/civetweb/civetweb.c -diff
 external/civetweb/civetweb.h -diff
+external/miniz/miniz.c -diff
+external/miniz/miniz.h -diff
+# Upstream ships LICENSE with CRLF line ends; keep it byte-identical to the
+# release (VENDORED.md records its hash).
+external/miniz/LICENSE -text
 # Binary files
 *.exe binary
 *.dll binary

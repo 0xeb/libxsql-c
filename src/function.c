@@ -47,7 +47,7 @@ static void scalar_wrapper_destroy(void *p) {
 }
 
 int xsql_db_create_function(xsql_db *db, const char *name, int argc,
-                            xsql_scalar_fn fn, void *user,
+                            unsigned flags, xsql_scalar_fn fn, void *user,
                             void (*destroy)(void *)) {
     if (!db || !db->db) {
         if (db) {
@@ -72,8 +72,13 @@ int xsql_db_create_function(xsql_db *db, const char *name, int argc,
     w->user = user;
     w->destroy = destroy;
 
-    int rc = sqlite3_create_function_v2(db->db, name, argc,
-                                        SQLITE_UTF8 | SQLITE_DETERMINISTIC, w,
+    // Not deterministic unless the caller says so (SQLite's own default): a
+    // deterministic constant-argument call may be evaluated once and reused.
+    const int text_rep =
+        SQLITE_UTF8 |
+        ((flags & (unsigned)XSQL_FUNCTION_DETERMINISTIC) ? SQLITE_DETERMINISTIC
+                                                          : 0);
+    int rc = sqlite3_create_function_v2(db->db, name, argc, text_rep, w,
                                         scalar_trampoline, NULL, NULL,
                                         scalar_wrapper_destroy);
     if (rc != SQLITE_OK) {
